@@ -19,6 +19,12 @@ namespace SmokyPluginV2
         [Description("Whether to restart an active round after the last player leaves the server.")]
         public bool RestartEmptyRound { get; set; } = true;
 
+        [Description("Settings for spawning first-time late joiners into a human role near the beginning of a round.")]
+        public LateJoinSpawnSettings LateJoinSpawn { get; set; } = new LateJoinSpawnSettings();
+
+        [Description("Settings for restoring the pink candy to SCP-330's bowl.")]
+        public PinkCandySettings PinkCandy { get; set; } = new PinkCandySettings();
+
         [Description("Persistent player warning settings.")]
         public WarningSettings Warnings { get; set; } = new WarningSettings();
 
@@ -27,6 +33,42 @@ namespace SmokyPluginV2
 
         [Description("Individual game events that can be sent to the Discord game-events channel.")]
         public DiscordEventLogs DiscordEventLogs { get; set; } = new DiscordEventLogs();
+    }
+
+    public sealed class LateJoinSpawnSettings
+    {
+        [Description("Whether first-time players may spawn after joining an active round.")]
+        public bool IsEnabled { get; set; } = true;
+
+        [Description("Latest allowed join time in seconds after the round starts.")]
+        public double MaxJoinTimeSeconds { get; set; } = 120;
+
+        [Description("Whether first-time players may spawn as a squad member after a main respawn wave.")]
+        public bool SpawnAfterMainWaves { get; set; } = true;
+
+        [Description("Latest allowed join time in seconds after a main MTF or Chaos wave. Reinforcement waves do not open or extend this window.")]
+        public double MainWaveJoinTimeSeconds { get; set; } = 60;
+
+        [Description("Delay before assigning the role, allowing player verification to finish.")]
+        public float SpawnDelaySeconds { get; set; } = 1;
+
+        [Description("Relative spawn chance for Class D. Default distribution: 37.5%.")]
+        public double ClassDChance { get; set; } = 37.5;
+
+        [Description("Relative spawn chance for Facility Guard. Default distribution: 37.5%.")]
+        public double FacilityGuardChance { get; set; } = 37.5;
+
+        [Description("Relative spawn chance for Scientist. Default distribution: 25%.")]
+        public double ScientistChance { get; set; } = 25;
+    }
+
+    public sealed class PinkCandySettings
+    {
+        [Description("Whether SCP-330 can give players the pink candy.")]
+        public bool IsEnabled { get; set; } = true;
+
+        [Description("Chance in percent that a candy taken from SCP-330 is replaced with the pink candy.")]
+        public double ChancePercent { get; set; } = 20;
     }
 
     public sealed class WarningSettings

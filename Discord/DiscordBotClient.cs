@@ -18,6 +18,7 @@ namespace SmokyPluginV2.Discord
     {
         private const string GatewayUrl = "wss://gateway.discord.gg/?v=10&encoding=json";
         private const string ApiBaseUrl = "https://discord.com/api/v10/";
+        private const int GatewayConnectTimeoutSeconds = 15;
 
         private readonly DiscordSettings settings;
         private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
@@ -40,7 +41,15 @@ namespace SmokyPluginV2.Discord
             ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
             ServicePointManager.DefaultConnectionLimit = Math.Max(ServicePointManager.DefaultConnectionLimit, 16);
 
-            httpClient = new HttpClient
+            HttpClientHandler httpHandler = new HttpClientHandler
+            {
+                // The game server reaches Discord through its routed VPN.
+                // Do not let Mono pick up a stale HTTP(S)_PROXY value from
+                // the hosting environment.
+                UseProxy = false,
+            };
+
+            httpClient = new HttpClient(httpHandler)
             {
                 BaseAddress = new Uri(ApiBaseUrl),
                 // Each request has its own timeout below. This lets transient
@@ -190,8 +199,10 @@ namespace SmokyPluginV2.Discord
                     socket?.Dispose();
                     socket = new ClientWebSocket();
                     socket.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
+                    socket.Options.Proxy = DirectConnectionProxy.Instance;
 
-                    await socket.ConnectAsync(new Uri(GatewayUrl), token).ConfigureAwait(false);
+                    Log.Info("[Discord] Connecting to the Gateway...");
+                    await ConnectGatewayWithTimeoutAsync(socket, token).ConfigureAwait(false);
                     Log.Info("[Discord] Gateway connection established.");
                     reconnectDelay = 2;
                     await ReceiveGatewayAsync(token).ConfigureAwait(false);
@@ -211,6 +222,35 @@ namespace SmokyPluginV2.Discord
                     await Task.Delay(TimeSpan.FromSeconds(reconnectDelay), token).ConfigureAwait(false);
                     reconnectDelay = Math.Min(reconnectDelay * 2, 30);
                 }
+            }
+        }
+
+        private static async Task ConnectGatewayWithTimeoutAsync(ClientWebSocket gatewaySocket, CancellationToken token)
+        {
+            using (CancellationTokenSource connectCancellation = CancellationTokenSource.CreateLinkedTokenSource(token))
+            {
+                Task connectTask = gatewaySocket.ConnectAsync(new Uri(GatewayUrl), connectCancellation.Token);
+                Task timeoutTask = Task.Delay(TimeSpan.FromSeconds(GatewayConnectTimeoutSeconds), token);
+                Task completed = await Task.WhenAny(connectTask, timeoutTask).ConfigureAwait(false);
+
+                if (completed == connectTask)
+                {
+                    await connectTask.ConfigureAwait(false);
+                    return;
+                }
+
+                connectCancellation.Cancel();
+                try
+                {
+                    gatewaySocket.Abort();
+                }
+                catch
+                {
+                }
+
+                ObserveAbandonedTask(connectTask);
+                token.ThrowIfCancellationRequested();
+                throw new TimeoutException($"Discord Gateway connection exceeded the hard {GatewayConnectTimeoutSeconds}-second timeout.");
             }
         }
 
@@ -797,6 +837,36 @@ namespace SmokyPluginV2.Discord
                 CancellationToken.None,
                 TaskContinuationOptions.ExecuteSynchronously,
                 TaskScheduler.Default);
+        }
+
+        private static void ObserveAbandonedTask(Task task)
+        {
+            task.ContinueWith(
+                completedTask =>
+                {
+                    if (completedTask.IsFaulted)
+                    {
+                        AggregateException ignored = completedTask.Exception;
+                    }
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+
+        private sealed class DirectConnectionProxy : IWebProxy
+        {
+            public static readonly DirectConnectionProxy Instance = new DirectConnectionProxy();
+
+            private DirectConnectionProxy()
+            {
+            }
+
+            public ICredentials Credentials { get; set; }
+
+            public Uri GetProxy(Uri destination) => destination;
+
+            public bool IsBypassed(Uri host) => true;
         }
 
         private void NotifyRateLimit(ulong channelId, double retrySeconds)

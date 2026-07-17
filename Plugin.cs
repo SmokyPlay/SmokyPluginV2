@@ -16,6 +16,8 @@ namespace SmokyPluginV2
     public sealed class Plugin : Plugin<Config>
     {
         private Handlers.EmptyRoundHandler emptyRoundHandler;
+        private Handlers.LateJoinSpawnHandler lateJoinSpawnHandler;
+        private Handlers.PinkCandyHandler pinkCandyHandler;
         private AccountLinkService accountLinkService;
         private Handlers.DiscordGameEventHandler discordGameEventHandler;
         private Handlers.DiscordModerationHandler discordModerationHandler;
@@ -34,6 +36,8 @@ namespace SmokyPluginV2
 
         internal DiscordLogService DiscordLogs => discordLogService;
 
+        internal Handlers.LateJoinSpawnHandler LateJoinSpawns => lateJoinSpawnHandler;
+
         /// <inheritdoc />
         public override string Name => "SmokyPluginV2";
 
@@ -44,7 +48,7 @@ namespace SmokyPluginV2
         public override string Author => "Smoky";
 
         /// <inheritdoc />
-        public override Version Version => new(0, 7, 0);
+        public override Version Version => new(0, 10, 0);
 
         /// <inheritdoc />
         public override Version RequiredExiledVersion => new(9, 14, 2);
@@ -62,6 +66,31 @@ namespace SmokyPluginV2
 
             emptyRoundHandler = new Handlers.EmptyRoundHandler();
             Exiled.Events.Handlers.Player.Left += emptyRoundHandler.OnLeft;
+
+            if (Config.LateJoinSpawn?.IsEnabled == true)
+            {
+                lateJoinSpawnHandler = new Handlers.LateJoinSpawnHandler();
+                lateJoinSpawnHandler.Register();
+            }
+
+            if (Config.PinkCandy?.IsEnabled == true)
+            {
+                pinkCandyHandler = new Handlers.PinkCandyHandler();
+                pinkCandyHandler.Register();
+            }
+
+            try
+            {
+                harmony = new Harmony($"smoky.smokypluginv2.{Assembly.GetExecutingAssembly().GetName().Version}");
+                harmony.PatchAll(Assembly.GetExecutingAssembly());
+                Log.Info("[SmokyPluginV2] Runtime patches have been enabled.");
+            }
+            catch (Exception exception)
+            {
+                Log.Error($"[SmokyPluginV2] Runtime patches could not be enabled:\n{exception}");
+                harmony?.UnpatchAll(harmony.Id);
+                harmony = null;
+            }
 
             if (Config.Discord?.IsEnabled == true)
             {
@@ -94,18 +123,6 @@ namespace SmokyPluginV2
                     discordModerationHandler = new Handlers.DiscordModerationHandler();
                     discordModerationHandler.Register();
 
-                    try
-                    {
-                        harmony = new Harmony($"smoky.smokypluginv2.{Assembly.GetExecutingAssembly().GetName().Version}");
-                        harmony.PatchAll(Assembly.GetExecutingAssembly());
-                        Log.Info("[Discord] Remote Admin command logging has been enabled.");
-                    }
-                    catch (Exception exception)
-                    {
-                        Log.Error($"[Discord] Remote Admin command logging could not be enabled:\n{exception}");
-                        harmony?.UnpatchAll(harmony.Id);
-                        harmony = null;
-                    }
                 }
             }
 
@@ -141,6 +158,12 @@ namespace SmokyPluginV2
                 Exiled.Events.Handlers.Player.Left -= emptyRoundHandler.OnLeft;
                 emptyRoundHandler = null;
             }
+
+            lateJoinSpawnHandler?.Unregister();
+            lateJoinSpawnHandler = null;
+
+            pinkCandyHandler?.Unregister();
+            pinkCandyHandler = null;
 
             Instance = null;
             base.OnDisabled();

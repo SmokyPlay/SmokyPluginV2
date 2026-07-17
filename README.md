@@ -2,7 +2,7 @@
 
 EXILED 9.14.2 plugin for SCP: Secret Laboratory 14.2.7.
 
-Version 0.7.0 includes an integrated Discord bot, persistent warnings, Steam-to-Discord account linking and Discord-role synchronization. The bot runs inside the plugin process; no NodeJS application, OAuth callback or separate bot executable is required.
+Version 0.10.0 includes an integrated Discord bot, persistent warnings, Steam-to-Discord account linking, Discord-role synchronization, first-time late-join spawning and the restored pink SCP-330 candy. The bot runs inside the plugin process; no NodeJS application, OAuth callback or separate bot executable is required.
 
 ## Current features
 
@@ -13,6 +13,9 @@ Version 0.7.0 includes an integrated Discord bot, persistent warnings, Steam-to-
 - Warning creation and deletion enforce the Remote Admin hierarchy without exposing its numeric values in responses or logs.
 - The YAML file is checked before every warning operation, so valid manual edits are visible without restarting the server.
 - Immediate active-round restart after the last player leaves.
+- First-time late joiners can spawn as Class D, Facility Guard or Scientist during a configurable opening window; reconnecting participants cannot spawn again.
+- After a main MTF or Chaos wave, first-time joiners have a separate 60-second window to spawn as an MTF Private or Chaos Rifleman. Reinforcement mini-waves are ignored.
+- SCP-330 can replace a candy drawn from its bowl with the pink candy at a configurable chance (20% by default).
 - Classic Discord game-event logs: plain text, timestamps, emoji and one-second batching like the old DiscordIntegration plugin.
 - Player join logs include IP addresses by default.
 - An individual switch for every game-event type.
@@ -58,13 +61,25 @@ Leave **Interactions Endpoint URL** empty in the Developer Portal. Slash-command
 
 ## EXILED configuration
 
-Start the server once with version 0.7.0 to let EXILED add the new fields to `config.yml`, then stop it and fill in the IDs:
+Start the server once with version 0.10.0 to let EXILED add the new fields to `config.yml`, then stop it and fill in the IDs:
 
 ```yaml
 smoky_plugin_v2:
   is_enabled: true
   debug: false
   restart_empty_round: true
+  late_join_spawn:
+    is_enabled: true
+    max_join_time_seconds: 120
+    spawn_after_main_waves: true
+    main_wave_join_time_seconds: 60
+    spawn_delay_seconds: 1
+    class_d_chance: 37.5
+    facility_guard_chance: 37.5
+    scientist_chance: 25
+  pink_candy:
+    is_enabled: true
+    chance_percent: 20
   warnings:
     is_enabled: true
     notify_player: true
@@ -93,6 +108,10 @@ smoky_plugin_v2:
       code_lifetime_minutes: 5
       preserve_native_group: true
 ```
+
+`late_join_spawn` applies only to a player whose UserId has not appeared in the current round. Players already online when the round starts are remembered immediately. A player who dies, leaves and reconnects therefore remains a spectator. The three chance values are relative weights, so they do not have to add up to exactly 100; negative values are treated as zero. A main MTF wave opens a separate window for `NtfPrivate`, while a main Chaos wave opens it for `ChaosRifleman`; reinforcement mini-waves neither open nor extend that window. The first main wave permanently closes the opening-round Class D, Guard and Scientist window, including when an administrator spawns that wave unusually early.
+
+`pink_candy.chance_percent` is clamped to 0-100. The selected bowl candy is replaced directly, so normal SCP-330 inventory limits, usage counting and hand-severing behavior are preserved.
 
 `role_groups` is checked from top to bottom. The first Discord role owned by the member selects the Remote Admin group. Every referenced group must exist in `config_remoteadmin.txt` and, for plugin permission nodes, in Exiled.Permissions `permissions.yml`.
 

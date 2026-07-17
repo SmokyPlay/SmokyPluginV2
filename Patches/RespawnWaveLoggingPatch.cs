@@ -17,6 +17,18 @@ namespace SmokyPluginV2.Patches
         [HarmonyPostfix]
         private static void Postfix(SpawnableWaveBase __0, List<ReferenceHub> __result)
         {
+            if (__0 is not null)
+            {
+                string waveType = __0.GetType().Name;
+                bool isMiniWave = waveType.IndexOf("Mini", System.StringComparison.OrdinalIgnoreCase) >= 0;
+                bool isChaos = waveType.IndexOf("Chaos", System.StringComparison.OrdinalIgnoreCase) >= 0;
+                bool isNtf = waveType.IndexOf("Ntf", System.StringComparison.OrdinalIgnoreCase) >= 0;
+                if (!isMiniWave && (isChaos || isNtf))
+                {
+                    Plugin.Instance?.LateJoinSpawns?.OnMainWaveSpawned(isChaos);
+                }
+            }
+
             DiscordLogService.Current?.LogRespawnWave(__0, __result?.Count ?? 0);
         }
     }
