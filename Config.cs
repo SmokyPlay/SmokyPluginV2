@@ -25,6 +25,9 @@ namespace SmokyPluginV2
         [Description("Settings for restoring the pink candy to SCP-330's bowl.")]
         public PinkCandySettings PinkCandy { get; set; } = new PinkCandySettings();
 
+        [Description("Pre-round role preference UI and role assignment settings.")]
+        public RolePreferenceSettings RolePreferences { get; set; } = new RolePreferenceSettings();
+
         [Description("Persistent player warning settings.")]
         public WarningSettings Warnings { get; set; } = new WarningSettings();
 
@@ -69,6 +72,150 @@ namespace SmokyPluginV2
 
         [Description("Chance in percent that a candy taken from SCP-330 is replaced with the pink candy.")]
         public double ChancePercent { get; set; } = 20;
+    }
+
+    public sealed class RolePreferenceSettings
+    {
+        [Description("Whether players can submit round-start role preferences in the pre-round tower.")]
+        public bool IsEnabled { get; set; } = true;
+
+        [Description("Pre-round tower selection settings.")]
+        public RolePreferenceTowerSettings Tower { get; set; } = new RolePreferenceTowerSettings();
+
+        [Description("Relative selection weight for players whose group is not present in priority_tiers.")]
+        public double DefaultWeight { get; set; } = 1;
+
+        [Description("Priority tiers. A player's current Remote Admin group is matched case-insensitively; the highest-weight match wins.")]
+        public List<RolePreferencePriorityTier> PriorityTiers { get; set; } = new List<RolePreferencePriorityTier>
+        {
+            new RolePreferencePriorityTier
+            {
+                Name = "sponsor",
+                Weight = 2.5,
+                Groups = new List<string> { "sponsor" },
+            },
+            new RolePreferencePriorityTier
+            {
+                Name = "premium",
+                Weight = 2,
+                Groups = new List<string> { "premium" },
+            },
+            new RolePreferencePriorityTier
+            {
+                Name = "vip",
+                Weight = 1.5,
+                Groups = new List<string> { "vip" },
+            },
+        };
+    }
+
+    public sealed class RolePreferenceTowerSettings
+    {
+        [Description("Whether players should spawn as Tutorial in the tower and select a class by standing in a colored zone.")]
+        public bool IsEnabled { get; set; } = true;
+
+        [Description("Whether zone positions should be calculated from the current native Tutorial spawn and the surrounding room walls.")]
+        public bool UseDynamicZonePositions { get; set; } = true;
+
+        [Description("Gap in meters between a dynamically sized zone edge and each adjacent room wall.")]
+        public float DynamicZoneWallGap { get; set; } = 0.18f;
+
+        [Description("Walkway gap in meters between dynamically sized zones.")]
+        public float DynamicZoneCenterGap { get; set; } = 0.5f;
+
+        [Description("Scale applied to the largest square zones that fit the measured room. Values below 1 make the zones smaller while keeping them in the corners.")]
+        public float DynamicZoneSizeScale { get; set; } = 0.85f;
+
+        [Description("Fallback tower center used only when dynamic zone positioning is disabled.")]
+        public RolePreferencePoint Center { get; set; } = new RolePreferencePoint(53.6f, 1018.4f, -44.6f);
+
+        [Description("Center of the red SCP selection zone.")]
+        public RolePreferencePoint ScpZone { get; set; } = new RolePreferencePoint(50.9f, 1018.15f, -40.7f);
+
+        [Description("Center of the yellow Scientist selection zone.")]
+        public RolePreferencePoint ScientistZone { get; set; } = new RolePreferencePoint(56.3f, 1018.15f, -40.7f);
+
+        [Description("Center of the orange Class D selection zone.")]
+        public RolePreferencePoint ClassDZone { get; set; } = new RolePreferencePoint(50.9f, 1018.15f, -48.5f);
+
+        [Description("Center of the blue Facility Guard selection zone.")]
+        public RolePreferencePoint FacilityGuardZone { get; set; } = new RolePreferencePoint(56.3f, 1018.15f, -48.5f);
+
+        [Description("Half-size of each square selection zone in meters.")]
+        public float ZoneRadius { get; set; } = 1.4f;
+
+        [Description("Lobby countdown text. Supports {time}.")]
+        public string LobbyTimerCountdown { get; set; } = "Раунд начнется через {time} секунд";
+
+        [Description("Text shown while the native lobby countdown is paused.")]
+        public string LobbyTimerRoundPaused { get; set; } = "Запуск раунда приостановлен";
+
+        [Description("Text shown while the round is starting.")]
+        public string LobbyTimerRoundStarting { get; set; } = "Раунд начинается!";
+
+        [Description("Connected-player text. Supports {players}.")]
+        public string LobbyTimerPlayersConnected { get; set; } = "{players} игроков подключилось";
+
+        [Description("Displayed name for a random role selection.")]
+        public string RandomRoleName { get; set; } = "Случайно";
+
+        [Description("Displayed name for the SCP role category.")]
+        public string ScpRoleName { get; set; } = "SCP";
+
+        [Description("Displayed name for the Scientist role category.")]
+        public string ScientistRoleName { get; set; } = "Научный Сотрудник";
+
+        [Description("Displayed name for the Class D role category.")]
+        public string ClassDRoleName { get; set; } = "Персонал класса D";
+
+        [Description("Displayed name for the Facility Guard role category.")]
+        public string FacilityGuardRoleName { get; set; } = "Охранник Комплекса";
+
+        [Description("Selected-class hint line. Supports {role} and {color}.")]
+        public string SelectedClassText { get; set; } = "Выбранный класс: <color={color}><b>{role}</b></color>";
+
+        [Description("Probability hint line. Supports {probability}.")]
+        public string ProbabilityText { get; set; } = "Вероятность: <b>{probability}</b>";
+
+        [Description("Contested-selection hint line. Supports {requested}, {slots}, and {weight}.")]
+        public string CompetitionText { get; set; } = "Желающих: {requested} · мест: {slots} · вес: {weight}";
+
+        [Description("Hint line shown while the player's class is random.")]
+        public string RandomInstructionText { get; set; } = "Войдите в одну из четырёх цветных зон";
+
+    }
+
+    public sealed class RolePreferencePoint
+    {
+        public RolePreferencePoint()
+        {
+        }
+
+        public RolePreferencePoint(float x, float y, float z)
+        {
+            X = x;
+            Y = y;
+            Z = z;
+        }
+
+        public float X { get; set; }
+
+        public float Y { get; set; }
+
+        public float Z { get; set; }
+    }
+
+    public sealed class RolePreferencePriorityTier
+    {
+        [Description("Human-readable tier name used in logs and confirmations.")]
+        public string Name { get; set; } = string.Empty;
+
+        [Description("Relative weight used only when more players request a role than there are slots.")]
+        public double Weight { get; set; } = 1;
+
+        [Description("Remote Admin group names included in this tier.")]
+        public List<string> Groups { get; set; } = new List<string>();
+
     }
 
     public sealed class WarningSettings

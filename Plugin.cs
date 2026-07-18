@@ -9,6 +9,7 @@ namespace SmokyPluginV2
 
     using SmokyPluginV2.AccountLinks;
     using SmokyPluginV2.Discord;
+    using SmokyPluginV2.RolePreferences;
 
     /// <summary>
     /// Main EXILED plugin entry point.
@@ -18,6 +19,7 @@ namespace SmokyPluginV2
         private Handlers.EmptyRoundHandler emptyRoundHandler;
         private Handlers.LateJoinSpawnHandler lateJoinSpawnHandler;
         private Handlers.PinkCandyHandler pinkCandyHandler;
+        private RolePreferenceService rolePreferenceService;
         private AccountLinkService accountLinkService;
         private Handlers.DiscordGameEventHandler discordGameEventHandler;
         private Handlers.DiscordModerationHandler discordModerationHandler;
@@ -38,6 +40,8 @@ namespace SmokyPluginV2
 
         internal Handlers.LateJoinSpawnHandler LateJoinSpawns => lateJoinSpawnHandler;
 
+        internal RolePreferenceService RolePreferences => rolePreferenceService;
+
         /// <inheritdoc />
         public override string Name => "SmokyPluginV2";
 
@@ -48,7 +52,7 @@ namespace SmokyPluginV2
         public override string Author => "Smoky";
 
         /// <inheritdoc />
-        public override Version Version => new(0, 10, 0);
+        public override Version Version => new(0, 13, 4);
 
         /// <inheritdoc />
         public override Version RequiredExiledVersion => new(9, 14, 2);
@@ -79,10 +83,17 @@ namespace SmokyPluginV2
                 pinkCandyHandler.Register();
             }
 
+            if (Config.RolePreferences?.IsEnabled == true)
+            {
+                rolePreferenceService = new RolePreferenceService(Config.RolePreferences);
+                rolePreferenceService.Register();
+            }
+
             try
             {
                 harmony = new Harmony($"smoky.smokypluginv2.{Assembly.GetExecutingAssembly().GetName().Version}");
                 harmony.PatchAll(Assembly.GetExecutingAssembly());
+                rolePreferenceService?.SetRuntimePatchesAvailable(true);
                 Log.Info("[SmokyPluginV2] Runtime patches have been enabled.");
             }
             catch (Exception exception)
@@ -90,6 +101,7 @@ namespace SmokyPluginV2
                 Log.Error($"[SmokyPluginV2] Runtime patches could not be enabled:\n{exception}");
                 harmony?.UnpatchAll(harmony.Id);
                 harmony = null;
+                rolePreferenceService?.SetRuntimePatchesAvailable(false);
             }
 
             if (Config.Discord?.IsEnabled == true)
@@ -164,6 +176,9 @@ namespace SmokyPluginV2
 
             pinkCandyHandler?.Unregister();
             pinkCandyHandler = null;
+
+            rolePreferenceService?.Unregister();
+            rolePreferenceService = null;
 
             Instance = null;
             base.OnDisabled();

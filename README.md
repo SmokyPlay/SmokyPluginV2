@@ -2,7 +2,7 @@
 
 EXILED 9.14.2 plugin for SCP: Secret Laboratory 14.2.7.
 
-Version 0.10.0 includes an integrated Discord bot, persistent warnings, Steam-to-Discord account linking, Discord-role synchronization, first-time late-join spawning and the restored pink SCP-330 candy. The bot runs inside the plugin process; no NodeJS application, OAuth callback or separate bot executable is required.
+Version 0.13.4 reduces the neutral area around the native Tutorial spawn so the nearby Guard zone responds at its visible edge.
 
 ## Current features
 
@@ -16,6 +16,9 @@ Version 0.10.0 includes an integrated Discord bot, persistent warnings, Steam-to
 - First-time late joiners can spawn as Class D, Facility Guard or Scientist during a configurable opening window; reconnecting participants cannot spawn again.
 - After a main MTF or Chaos wave, first-time joiners have a separate 60-second window to spawn as an MTF Private or Chaos Rifleman. Reinforcement mini-waves are ignored.
 - SCP-330 can replace a candy drawn from its bowl with the pink candy at a configurable chance (20% by default).
+- Pre-round tower with colored zones for SCP, Научный Сотрудник, Персонал класса D and Охранник Комплекса.
+- Native server lobby countdown, selected class, expected slot count, effective weight and exact live probability in a hint.
+- Configurable Remote Admin group tiers increase selection weight only when a requested role is oversubscribed.
 - Classic Discord game-event logs: plain text, timestamps, emoji and one-second batching like the old DiscordIntegration plugin.
 - Player join logs include IP addresses by default.
 - An individual switch for every game-event type.
@@ -61,7 +64,7 @@ Leave **Interactions Endpoint URL** empty in the Developer Portal. Slash-command
 
 ## EXILED configuration
 
-Start the server once with version 0.10.0 to let EXILED add the new fields to `config.yml`, then stop it and fill in the IDs:
+Start the server once with version 0.13.4 to let EXILED add the new fields to `config.yml`, then stop it and fill in the IDs:
 
 ```yaml
 smoky_plugin_v2:
@@ -80,6 +83,47 @@ smoky_plugin_v2:
   pink_candy:
     is_enabled: true
     chance_percent: 20
+  role_preferences:
+    is_enabled: true
+    tower:
+      is_enabled: true
+      use_dynamic_zone_positions: true
+      dynamic_zone_wall_gap: 0.18
+      dynamic_zone_center_gap: 0.5
+      dynamic_zone_size_scale: 0.85
+      center: { x: 53.6, y: 1018.4, z: -44.6 }
+      scp_zone: { x: 50.9, y: 1018.15, z: -40.7 }
+      scientist_zone: { x: 56.3, y: 1018.15, z: -40.7 }
+      class_d_zone: { x: 50.9, y: 1018.15, z: -48.5 }
+      facility_guard_zone: { x: 56.3, y: 1018.15, z: -48.5 }
+      zone_radius: 1.4
+      lobby_timer_countdown: 'Раунд начнется через {time} секунд'
+      lobby_timer_round_paused: 'Запуск раунда приостановлен'
+      lobby_timer_round_starting: 'Раунд начинается!'
+      lobby_timer_players_connected: '{players} игроков подключилось'
+      random_role_name: 'Случайно'
+      scp_role_name: 'SCP'
+      scientist_role_name: 'Научный Сотрудник'
+      class_d_role_name: 'Персонал класса D'
+      facility_guard_role_name: 'Охранник Комплекса'
+      selected_class_text: 'Выбранный класс: <color={color}><b>{role}</b></color>'
+      probability_text: 'Вероятность: <b>{probability}</b>'
+      competition_text: 'Желающих: {requested} · мест: {slots} · вес: {weight}'
+      random_instruction_text: 'Войдите в одну из четырёх цветных зон'
+    default_weight: 1
+    priority_tiers:
+      - name: sponsor
+        weight: 2.5
+        groups:
+          - sponsor
+      - name: premium
+        weight: 2
+        groups:
+          - premium
+      - name: vip
+        weight: 1.5
+        groups:
+          - vip
   warnings:
     is_enabled: true
     notify_player: true
@@ -112,6 +156,16 @@ smoky_plugin_v2:
 `late_join_spawn` applies only to a player whose UserId has not appeared in the current round. Players already online when the round starts are remembered immediately. A player who dies, leaves and reconnects therefore remains a spectator. The three chance values are relative weights, so they do not have to add up to exactly 100; negative values are treated as zero. A main MTF wave opens a separate window for `NtfPrivate`, while a main Chaos wave opens it for `ChaosRifleman`; reinforcement mini-waves neither open nor extend that window. The first main wave permanently closes the opening-round Class D, Guard and Scientist window, including when an administrator spawns that wave unusually early.
 
 `pink_candy.chance_percent` is clamped to 0-100. The selected bowl candy is replaced directly, so normal SCP-330 inventory limits, usage counting and hand-severing behavior are preserved.
+
+During `WaitingForPlayers`, every connected player is assigned Tutorial and the game places them at its native Tutorial spawn in the tower; the plugin does not override player coordinates. Remaining in a colored zone for `selection_hold_seconds` changes the preference; moving away does not erase it, and entering another zone replaces it. A selection is valid only for the upcoming round and is cleared when the next lobby begins. The hint reads the game's own `RoundStart.NetworkTimer`, so the displayed duration follows the server's native lobby configuration and lobby pause state.
+
+The displayed probability is calculated exactly for the same sequential weighted draw without replacement used at round start. Candidates with the same effective weight are grouped, and a dynamic program evaluates every reachable winner-count state. The value is deterministic and recalculated whenever a player joins, leaves, changes group, or changes selection.
+
+At round start a narrowly scoped Harmony postfix allows only registered tower participants who are still Tutorial to pass `RoleAssigner.CheckPlayer`, and only while `RoleAssigner.OnRoundStarted` is executing. The existing atomic SCP and human spawner hooks then replace Tutorial directly with the final role. No intermediate Spectator role is assigned, which avoids a second post-start role swap and duplicate starting inventories.
+
+`priority_tiers` matches the player's current Remote Admin group case-insensitively. `weight` is relative: with one contested slot, weight `2` is twice as likely as one ordinary weight-`1` player, not a guaranteed win. When several slots exist, winners are drawn one at a time without replacement and weights are recalculated after every winner. The configured weight applies in every contested allocation.
+
+The tower chooses the general SCP category. During vanilla role generation, the plugin keeps the generated role counts and exact SCP lineup but selects their players before the first role assignment.
 
 `role_groups` is checked from top to bottom. The first Discord role owned by the member selects the Remote Admin group. Every referenced group must exist in `config_remoteadmin.txt` and, for plugin permission nodes, in Exiled.Permissions `permissions.yml`.
 
