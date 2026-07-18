@@ -116,6 +116,7 @@
     <Compile Include="AccountLinks\AccountLinkRecord.cs" />
     <Compile Include="AccountLinks\AccountLinkService.cs" />
     <Compile Include="Commands\AccountLinkCommands.cs" />
+    <Compile Include="Commands\EventLobbyCommand.cs" />
     <Compile Include="Commands\MyWarningsCommand.cs" />
     <Compile Include="Commands\WarningCommands.cs" />
     <Compile Include="Config.cs" />
@@ -128,6 +129,7 @@
     <Compile Include="Handlers\DiscordGameEventHandler.cs" />
     <Compile Include="Handlers\DiscordModerationHandler.cs" />
     <Compile Include="Handlers\EmptyRoundHandler.cs" />
+    <Compile Include="Handlers\EndRoundFriendlyFireHandler.cs" />
     <Compile Include="Handlers\LateJoinSpawnHandler.cs" />
     <Compile Include="Handlers\PinkCandyHandler.cs" />
     <Compile Include="Patches\DiscordPermissionPatch.cs" />

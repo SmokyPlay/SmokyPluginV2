@@ -19,6 +19,9 @@ namespace SmokyPluginV2
         [Description("Whether to restart an active round after the last player leaves the server.")]
         public bool RestartEmptyRound { get; set; } = true;
 
+        [Description("Settings for enabling friendly fire only after a round has ended.")]
+        public EndRoundFriendlyFireSettings EndRoundFriendlyFire { get; set; } = new EndRoundFriendlyFireSettings();
+
         [Description("Settings for spawning first-time late joiners into a human role near the beginning of a round.")]
         public LateJoinSpawnSettings LateJoinSpawn { get; set; } = new LateJoinSpawnSettings();
 
@@ -36,6 +39,12 @@ namespace SmokyPluginV2
 
         [Description("Individual game events that can be sent to the Discord game-events channel.")]
         public DiscordEventLogs DiscordEventLogs { get; set; } = new DiscordEventLogs();
+    }
+
+    public sealed class EndRoundFriendlyFireSettings
+    {
+        [Description("Whether friendly fire should be enabled after RoundEnded and disabled before the next round.")]
+        public bool IsEnabled { get; set; } = true;
     }
 
     public sealed class LateJoinSpawnSettings
@@ -183,6 +192,21 @@ namespace SmokyPluginV2
         [Description("Hint line shown while the player's class is random.")]
         public string RandomInstructionText { get; set; } = "Войдите в одну из четырёх цветных зон";
 
+        [Description("Event briefing lobby lock, voice restriction, and hint settings.")]
+        public EventBriefingSettings EventBriefing { get; set; } = new EventBriefingSettings();
+
+    }
+
+    public sealed class EventBriefingSettings
+    {
+        [Description("Whether the eventlobby Remote Admin command is enabled.")]
+        public bool IsEnabled { get; set; } = true;
+
+        [Description("Hint line replacing the selected class while the event briefing is active.")]
+        public string AnnouncementText { get; set; } = "В этом раунде проводится ивент";
+
+        [Description("Remote Admin groups whose players may speak during the event briefing.")]
+        public List<string> MuteExemptGroups { get; set; } = new List<string> { "owner", "admin" };
     }
 
     public sealed class RolePreferencePoint

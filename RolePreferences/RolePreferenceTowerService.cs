@@ -2,8 +2,10 @@ namespace SmokyPluginV2.RolePreferences
 {
     using System;
     using System.Collections.Generic;
+    using System.IO;
     using System.Linq;
 
+    using Exiled.API.Extensions;
     using Exiled.API.Features;
 
     using GameCore;
@@ -30,6 +32,7 @@ namespace SmokyPluginV2.RolePreferences
         private readonly RolePreferenceTowerSettings settings;
         private readonly Dictionary<ReferenceHub, ParticipantState> participants = new Dictionary<ReferenceHub, ParticipantState>();
         private readonly Dictionary<RolePreferenceCategory, Vector3> zonePositions = new Dictionary<RolePreferenceCategory, Vector3>();
+        private readonly HashSet<ReferenceHub> eventBriefingMutedPlayers = new HashSet<ReferenceHub>();
         private readonly List<ExiledToy> toys = new List<ExiledToy>();
         private Dictionary<ReferenceHub, double> probabilities = new Dictionary<ReferenceHub, double>();
         private CoroutineHandle loop;
@@ -44,6 +47,7 @@ namespace SmokyPluginV2.RolePreferences
         private Vector3 randomSelectionCenter;
         private bool randomSelectionCenterSet;
         private float nextHintAt;
+        private bool eventBriefingActive;
 
         public RolePreferenceTowerService(RolePreferenceService owner, RolePreferenceTowerSettings settings)
         {
@@ -71,6 +75,7 @@ namespace SmokyPluginV2.RolePreferences
 
         public void StopLobby()
         {
+            DisableEventBriefing();
             lobbyActive = false;
             StopLoop();
             ClearParticipantHints();
@@ -90,6 +95,7 @@ namespace SmokyPluginV2.RolePreferences
 
         public void BeginRoleAssignment()
         {
+            DisableEventBriefing();
             lobbyActive = false;
             StopLoop();
             ClearParticipantHints();
@@ -151,6 +157,8 @@ namespace SmokyPluginV2.RolePreferences
             {
                 player.IsGodModeEnabled = true;
             }
+
+            SyncEventBriefingMute(player);
         }
 
         public void Remove(ReferenceHub hub)
@@ -164,6 +172,32 @@ namespace SmokyPluginV2.RolePreferences
         }
 
         public void MarkProbabilityDirty() => probabilityDirty = true;
+
+        public bool TryToggleEventBriefing(out bool enabled, out string error)
+        {
+            enabled = eventBriefingActive;
+            EventBriefingSettings briefing = settings.EventBriefing;
+            if (briefing?.IsEnabled != true)
+            {
+                error = "Система блокировки лобби для ивента отключена в конфиге.";
+                return false;
+            }
+
+            if (!lobbyActive || !Round.IsLobby || RoundStart.singleton is null)
+            {
+                error = "Команда доступна только во время лобби в башне.";
+                return false;
+            }
+
+            if (eventBriefingActive)
+                DisableEventBriefing();
+            else
+                EnableEventBriefing();
+
+            enabled = eventBriefingActive;
+            error = null;
+            return true;
+        }
 
         private IEnumerator<float> LobbyLoop()
         {
@@ -280,6 +314,17 @@ namespace SmokyPluginV2.RolePreferences
                 .Replace("{probability}", probability);
             int competitionSize = category == RolePreferenceCategory.None ? 20 : 17;
 
+            if (eventBriefingActive)
+            {
+                string announcement = settings.EventBriefing?.AnnouncementText ?? string.Empty;
+                player.ShowHint(
+                    $"<size=28><b>{timer}</b></size>\n" +
+                    $"<size=28><b>{playersConnected}</b></size>\n" +
+                    announcement,
+                    HintDuration);
+                return;
+            }
+
             player.ShowHint(
                 $"<size=28><b>{timer}</b></size>\n" +
                 $"<size=28><b>{playersConnected}</b></size>\n" +
@@ -287,6 +332,110 @@ namespace SmokyPluginV2.RolePreferences
                 $"{probabilityLine}\n" +
                 $"<size={competitionSize}>{competition}</size>",
                 HintDuration);
+        }
+
+        private void EnableEventBriefing()
+        {
+            if (eventBriefingActive)
+                return;
+
+            RoundStart.LobbyLock = true;
+            eventBriefingActive = true;
+            nextHintAt = 0;
+            foreach (ReferenceHub hub in participants.Keys.ToList())
+                SyncEventBriefingMute(Player.Get(hub));
+
+            Log.Info("[Role Preferences] Event briefing enabled: lobby locked and participants temporarily muted.");
+        }
+
+        private void DisableEventBriefing()
+        {
+            if (!eventBriefingActive && eventBriefingMutedPlayers.Count == 0)
+                return;
+
+            eventBriefingActive = false;
+            RoundStart.LobbyLock = false;
+            foreach (ReferenceHub hub in eventBriefingMutedPlayers.ToList())
+                RemoveEventBriefingMute(Player.Get(hub));
+
+            eventBriefingMutedPlayers.Clear();
+            nextHintAt = 0;
+            Log.Info("[Role Preferences] Event briefing disabled: lobby lock and plugin-owned temporary mutes removed.");
+        }
+
+        private void SyncEventBriefingMute(Player player)
+        {
+            if (!eventBriefingActive || player is null || !player.IsConnected || !Contains(player.ReferenceHub))
+                return;
+
+            if (IsInConfiguredGroup(player, settings.EventBriefing?.MuteExemptGroups))
+            {
+                RemoveEventBriefingMute(player);
+                return;
+            }
+
+            ReferenceHub hub = player.ReferenceHub;
+            if (eventBriefingMutedPlayers.Contains(hub))
+            {
+                if (!player.IsMuted)
+                    player.IsMuted = true;
+                return;
+            }
+
+            // A mute that existed before the briefing belongs to the game or an
+            // administrator. Do not claim ownership of it and never clear it.
+            if (player.IsMuted)
+                return;
+
+            player.IsMuted = true;
+            eventBriefingMutedPlayers.Add(hub);
+        }
+
+        private void RemoveEventBriefingMute(Player player)
+        {
+            ReferenceHub hub = player?.ReferenceHub;
+            if (hub is null || !eventBriefingMutedPlayers.Remove(hub) || !player.IsConnected)
+                return;
+
+            if (!IsInPersistentMuteFile(player.UserId))
+                player.IsMuted = false;
+        }
+
+        private static bool IsInPersistentMuteFile(string userId)
+        {
+            if (string.IsNullOrWhiteSpace(userId))
+                return true;
+
+            string path = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "SCP Secret Laboratory",
+                "config",
+                Server.Port.ToString(),
+                "mutes.txt");
+
+            if (!File.Exists(path))
+                return false;
+
+            try
+            {
+                using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                using (StreamReader reader = new StreamReader(stream))
+                {
+                    string line;
+                    while ((line = reader.ReadLine()) is not null)
+                    {
+                        if (string.Equals(line.Trim(), userId, StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+                }
+
+                return false;
+            }
+            catch (Exception exception)
+            {
+                Log.Error($"[Role Preferences] Could not verify persistent mute file '{path}'. The temporary mute will be kept to avoid revoking an administrative mute:\n{exception}");
+                return true;
+            }
         }
 
         private string GetTimerText()
@@ -555,6 +704,13 @@ namespace SmokyPluginV2.RolePreferences
             float dx = first.x - second.x;
             float dz = first.z - second.z;
             return (dx * dx) + (dz * dz);
+        }
+
+        private static bool IsInConfiguredGroup(Player player, IEnumerable<string> groups)
+        {
+            string group = player?.Group?.GetKey();
+            return !string.IsNullOrWhiteSpace(group) &&
+                   groups?.Any(candidate => string.Equals(candidate?.Trim(), group, StringComparison.OrdinalIgnoreCase)) == true;
         }
 
         private static Vector3 ToVector(RolePreferencePoint point) =>

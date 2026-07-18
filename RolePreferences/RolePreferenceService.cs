@@ -307,6 +307,18 @@ namespace SmokyPluginV2.RolePreferences
 
         internal double GetTowerWeight(ReferenceHub hub) => GetEffectiveWeight(hub);
 
+        internal bool TryToggleEventBriefing(out bool enabled, out string error)
+        {
+            if (tower is null)
+            {
+                enabled = false;
+                error = "Башня выбора ролей отключена.";
+                return false;
+            }
+
+            return tower.TryToggleEventBriefing(out enabled, out error);
+        }
+
         internal Dictionary<ReferenceHub, double> CalculateTowerProbabilities(IEnumerable<ReferenceHub> source)
         {
             List<ReferenceHub> players = source

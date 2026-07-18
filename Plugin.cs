@@ -17,6 +17,7 @@ namespace SmokyPluginV2
     public sealed class Plugin : Plugin<Config>
     {
         private Handlers.EmptyRoundHandler emptyRoundHandler;
+        private Handlers.EndRoundFriendlyFireHandler endRoundFriendlyFireHandler;
         private Handlers.LateJoinSpawnHandler lateJoinSpawnHandler;
         private Handlers.PinkCandyHandler pinkCandyHandler;
         private RolePreferenceService rolePreferenceService;
@@ -52,7 +53,7 @@ namespace SmokyPluginV2
         public override string Author => "Smoky";
 
         /// <inheritdoc />
-        public override Version Version => new(0, 13, 4);
+        public override Version Version => new(0, 15, 2);
 
         /// <inheritdoc />
         public override Version RequiredExiledVersion => new(9, 14, 2);
@@ -70,6 +71,12 @@ namespace SmokyPluginV2
 
             emptyRoundHandler = new Handlers.EmptyRoundHandler();
             Exiled.Events.Handlers.Player.Left += emptyRoundHandler.OnLeft;
+
+            if (Config.EndRoundFriendlyFire?.IsEnabled == true)
+            {
+                endRoundFriendlyFireHandler = new Handlers.EndRoundFriendlyFireHandler();
+                endRoundFriendlyFireHandler.Register();
+            }
 
             if (Config.LateJoinSpawn?.IsEnabled == true)
             {
@@ -170,6 +177,9 @@ namespace SmokyPluginV2
                 Exiled.Events.Handlers.Player.Left -= emptyRoundHandler.OnLeft;
                 emptyRoundHandler = null;
             }
+
+            endRoundFriendlyFireHandler?.Unregister();
+            endRoundFriendlyFireHandler = null;
 
             lateJoinSpawnHandler?.Unregister();
             lateJoinSpawnHandler = null;

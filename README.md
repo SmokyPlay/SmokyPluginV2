@@ -2,7 +2,7 @@
 
 EXILED 9.14.2 plugin for SCP: Secret Laboratory 14.2.7.
 
-Version 0.13.4 reduces the neutral area around the native Tutorial spawn so the nearby Guard zone responds at its visible edge.
+Version 0.15.2 uses non-persistent in-game voice mutes for event briefings while preserving administrative mutes.
 
 ## Current features
 
@@ -13,12 +13,14 @@ Version 0.13.4 reduces the neutral area around the native Tutorial spawn so the 
 - Warning creation and deletion enforce the Remote Admin hierarchy without exposing its numeric values in responses or logs.
 - The YAML file is checked before every warning operation, so valid manual edits are visible without restarting the server.
 - Immediate active-round restart after the last player leaves.
+- Friendly fire enabled only during the post-round period and forcibly disabled before the next round.
 - First-time late joiners can spawn as Class D, Facility Guard or Scientist during a configurable opening window; reconnecting participants cannot spawn again.
 - After a main MTF or Chaos wave, first-time joiners have a separate 60-second window to spawn as an MTF Private or Chaos Rifleman. Reinforcement mini-waves are ignored.
 - SCP-330 can replace a candy drawn from its bowl with the pink candy at a configurable chance (20% by default).
 - Pre-round tower with colored zones for SCP, Научный Сотрудник, Персонал класса D and Охранник Комплекса.
 - Native server lobby countdown, selected class, expected slot count, effective weight and exact live probability in a hint.
 - Configurable Remote Admin group tiers increase selection weight only when a requested role is oversubscribed.
+- `eventlobby` / `elobby` requires `smokyplugin.eventlobby`, toggles a paused event briefing, temporarily mutes participants with the in-game indicator, and keeps configured RA groups audible.
 - Classic Discord game-event logs: plain text, timestamps, emoji and one-second batching like the old DiscordIntegration plugin.
 - Player join logs include IP addresses by default.
 - An individual switch for every game-event type.
@@ -64,13 +66,15 @@ Leave **Interactions Endpoint URL** empty in the Developer Portal. Slash-command
 
 ## EXILED configuration
 
-Start the server once with version 0.13.4 to let EXILED add the new fields to `config.yml`, then stop it and fill in the IDs:
+Start the server once with version 0.15.2 to let EXILED add the new fields to `config.yml`, then stop it and fill in the IDs:
 
 ```yaml
 smoky_plugin_v2:
   is_enabled: true
   debug: false
   restart_empty_round: true
+  end_round_friendly_fire:
+    is_enabled: true
   late_join_spawn:
     is_enabled: true
     max_join_time_seconds: 120
@@ -110,6 +114,10 @@ smoky_plugin_v2:
       probability_text: 'Вероятность: <b>{probability}</b>'
       competition_text: 'Желающих: {requested} · мест: {slots} · вес: {weight}'
       random_instruction_text: 'Войдите в одну из четырёх цветных зон'
+      event_briefing:
+        is_enabled: true
+        announcement_text: 'В этом раунде проводится ивент'
+        mute_exempt_groups: [owner, admin]
     default_weight: 1
     priority_tiers:
       - name: sponsor
@@ -160,6 +168,8 @@ smoky_plugin_v2:
 During `WaitingForPlayers`, every connected player is assigned Tutorial and the game places them at its native Tutorial spawn in the tower; the plugin does not override player coordinates. Remaining in a colored zone for `selection_hold_seconds` changes the preference; moving away does not erase it, and entering another zone replaces it. A selection is valid only for the upcoming round and is cleared when the next lobby begins. The hint reads the game's own `RoundStart.NetworkTimer`, so the displayed duration follows the server's native lobby configuration and lobby pause state.
 
 The displayed probability is calculated exactly for the same sequential weighted draw without replacement used at round start. Candidates with the same effective weight are grouped, and a dynamic program evaluates every reachable winner-count state. The value is deterministic and recalculated whenever a player joins, leaves, changes group, or changes selection.
+
+During the tower lobby, a command sender with the EXILED permission `smokyplugin.eventlobby` may run `eventlobby` (aliases: `elobby`, `eventbriefing`) in Remote Admin. The first use locks the native lobby countdown, replaces the selected-class line with `announcement_text`, hides the probability and competition lines, and sets the non-persistent `Player.IsMuted` flag for tower participants outside the Remote Admin groups listed in `mute_exempt_groups`. Players who join while the briefing is active receive the same temporary mute. The second use or round start unlocks the lobby and removes only mutes owned by this feature; a player present in the server's `mutes.txt` is never unmuted. The persistent `Player.Mute()` and `Player.UnMute()` APIs are not used.
 
 At round start a narrowly scoped Harmony postfix allows only registered tower participants who are still Tutorial to pass `RoleAssigner.CheckPlayer`, and only while `RoleAssigner.OnRoundStarted` is executing. The existing atomic SCP and human spawner hooks then replace Tutorial directly with the final role. No intermediate Spectator role is assigned, which avoids a second post-start role swap and duplicate starting inventories.
 
