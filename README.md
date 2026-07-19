@@ -2,7 +2,7 @@
 
 EXILED 9.14.2 plugin for SCP: Secret Laboratory 14.2.7.
 
-Version 0.15.2 uses non-persistent in-game voice mutes for event briefings while preserving administrative mutes.
+Version 0.15.9 applies role-preference settings and Discord-to-RA role mappings after `reload configs`, while retaining compact batched logs and guarded Discord rate-limit handling.
 
 ## Current features
 
@@ -24,8 +24,10 @@ Version 0.15.2 uses non-persistent in-game voice mutes for event briefings while
 - Classic Discord game-event logs: plain text, timestamps, emoji and one-second batching like the old DiscordIntegration plugin.
 - Player join logs include IP addresses by default.
 - An individual switch for every game-event type.
-- A separate log for every Remote Admin command.
+- Compact Remote Admin command lines, with several commands combined into one Discord message when they arrive together.
 - Separate moderation embeds for kicks, bans, voice/intercom mutes, unmutes and unbans.
+- All Discord logs share one bounded worker queue, an 8-request-per-second REST gate, response-header bucket waits, and global `Retry-After` backoff; consecutive embeds for the same channel can be batched up to ten per request.
+- A 429 with Discord's global-block message pauses REST for one hour; an otherwise unclassified 429 without `Retry-After` uses bounded exponential backoff from 60 seconds to 15 minutes.
 - Bot presence: online while players are connected and idle while the server is empty.
 - Activity text: `{players} / {max_players} в игре`.
 - Discord `+` commands are executed through Remote Admin with permissions from the mapped Discord role.
@@ -66,7 +68,7 @@ Leave **Interactions Endpoint URL** empty in the Developer Portal. Slash-command
 
 ## EXILED configuration
 
-Start the server once with version 0.15.2 to let EXILED add the new fields to `config.yml`, then stop it and fill in the IDs:
+Start the server once with version 0.15.9 to let EXILED add the new fields to `config.yml`, then stop it and fill in the IDs:
 
 ```yaml
 smoky_plugin_v2:
@@ -179,6 +181,8 @@ The tower chooses the general SCP category. During vanilla role generation, the 
 
 `role_groups` is checked from top to bottom. The first Discord role owned by the member selects the Remote Admin group. Every referenced group must exist in `config_remoteadmin.txt` and, for plugin permission nodes, in Exiled.Permissions `permissions.yml`.
 
+After changing `role_groups`, run `reload configs`. Version 0.15.9 replaces the live mapping list and refreshes every linked online player; restarting the Discord client is not required. Changes to the bot token, guild ID, or whether the integrated bot is enabled still require a full server restart.
+
 ## Account linking and role synchronization
 
 The user runs this guild slash command in Discord:
@@ -264,7 +268,7 @@ Each entry under `discord_event_logs` is generated as `true`. Change any unwante
 
 Damage, door and item events can produce many Discord messages on an active server, even though they are enabled by default as requested. Disable those switches if the channel becomes too noisy.
 
-`log_ip_addresses: false` replaces the address in join lines with `REDACTED`. Game-event messages are sent as plain text; Remote Admin and moderation logs remain embeds.
+`log_ip_addresses: false` replaces the address in join lines with `REDACTED`. Game-event and Remote Admin command messages are sent as batched plain text; moderation logs remain embeds.
 
 ## Expected startup messages
 

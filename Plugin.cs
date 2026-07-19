@@ -53,7 +53,7 @@ namespace SmokyPluginV2
         public override string Author => "Smoky";
 
         /// <inheritdoc />
-        public override Version Version => new(0, 15, 2);
+        public override Version Version => new(0, 15, 9);
 
         /// <inheritdoc />
         public override Version RequiredExiledVersion => new(9, 14, 2);
@@ -192,6 +192,48 @@ namespace SmokyPluginV2
 
             Instance = null;
             base.OnDisabled();
+        }
+
+        internal void ReloadRolePreferenceConfiguration()
+        {
+            RolePreferenceService replacement = null;
+            try
+            {
+                if (Config?.RolePreferences?.IsEnabled == true)
+                {
+                    replacement = new RolePreferenceService(Config.RolePreferences);
+                    replacement.Register();
+                    replacement.SetRuntimePatchesAvailable(harmony is not null);
+                }
+            }
+            catch (Exception exception)
+            {
+                replacement?.Unregister();
+                Log.Error($"[Role Preferences] Reloaded configuration is invalid. The current runtime configuration remains active:\n{exception}");
+                return;
+            }
+
+            RolePreferenceService previous = rolePreferenceService;
+            previous?.Unregister();
+            rolePreferenceService = replacement;
+
+            try
+            {
+                replacement?.ResumeLobbyAfterConfigReload();
+                Log.Info(replacement is null
+                    ? "[Role Preferences] Runtime configuration reloaded; the role preference system is disabled."
+                    : "[Role Preferences] Runtime configuration reloaded successfully.");
+            }
+            catch (Exception exception)
+            {
+                Log.Error($"[Role Preferences] Configuration reloaded, but the tower could not be recreated in the current lobby. It will start normally in the next lobby:\n{exception}");
+            }
+        }
+
+        internal void ApplyReloadedConfiguration()
+        {
+            ReloadRolePreferenceConfiguration();
+            discordLogService?.ReloadRoleGroupMappings(Config?.Discord);
         }
     }
 }

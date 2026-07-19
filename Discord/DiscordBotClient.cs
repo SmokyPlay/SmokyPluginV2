@@ -1,6 +1,7 @@
 namespace SmokyPluginV2.Discord
 {
     using System;
+    using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Globalization;
     using System.IO;
@@ -19,16 +20,32 @@ namespace SmokyPluginV2.Discord
         private const string GatewayUrl = "wss://gateway.discord.gg/?v=10&encoding=json";
         private const string ApiBaseUrl = "https://discord.com/api/v10/";
         private const int GatewayConnectTimeoutSeconds = 15;
+        private const int MaxQueuedMessages = 2000;
+        private const int SafeRestIntervalMilliseconds = 125;
+        private const int ConfirmedGlobalRateLimitCooldownSeconds = 3600;
+        private const int MissingRetryAfterInitialCooldownSeconds = 60;
+        private const int MissingRetryAfterMaximumCooldownSeconds = 900;
 
         private readonly DiscordSettings settings;
         private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
         private readonly SemaphoreSlim gatewaySendLock = new SemaphoreSlim(1, 1);
+        private readonly SemaphoreSlim restRequestLock = new SemaphoreSlim(1, 1);
+        private readonly SemaphoreSlim outboundSignal = new SemaphoreSlim(0);
+        private readonly ConcurrentQueue<OutboundMessage> priorityOutbound = new ConcurrentQueue<OutboundMessage>();
+        private readonly ConcurrentQueue<OutboundMessage> normalOutbound = new ConcurrentQueue<OutboundMessage>();
+        private readonly object restRateLimitLock = new object();
         private readonly object rateLimitNotificationLock = new object();
         private readonly Dictionary<ulong, DateTime> rateLimitNotificationCooldowns = new Dictionary<ulong, DateTime>();
+        private readonly HashSet<ulong> blockedMessageChannels = new HashSet<ulong>();
         private readonly HttpClient httpClient;
 
         private ClientWebSocket socket;
+        private DateTime restBlockedUntilUtc;
+        private DateTime nextRestRequestUtc;
         private ulong applicationId;
+        private int queuedMessages;
+        private int droppedMessages;
+        private int consecutiveMissingRetryAfterResponses;
         private int slashCommandRegistrationRunning;
         private long? sequence;
         private string presenceText = "0 / 0 в игре";
@@ -57,7 +74,7 @@ namespace SmokyPluginV2.Discord
                 Timeout = Timeout.InfiniteTimeSpan,
             };
             httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bot", settings.Token);
-            httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("SmokyPluginV2/0.7.0");
+            httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("DiscordBot (https://github.com/SmokyPlay/SmokyPluginV2, 0.15.9)");
         }
 
         public event Action<DiscordMessage> PrefixedMessageReceived;
@@ -68,6 +85,7 @@ namespace SmokyPluginV2.Discord
 
         public void Start()
         {
+            Task.Run(() => ProcessOutboundQueueAsync(cancellation.Token));
             Task.Run(() => RunGatewayLoopAsync(cancellation.Token));
         }
 
@@ -76,9 +94,12 @@ namespace SmokyPluginV2.Discord
             if (channelId == 0 || disposed)
                 return;
 
-            string safeTitle = Limit(title, 256);
-            string safeDescription = Limit(description, 4000);
-            RunDetached(channelId, () => SendEmbedInternalAsync(channelId, safeTitle, safeDescription, color, cancellation.Token));
+            EnqueueOutbound(OutboundMessage.Embed(
+                channelId,
+                Limit(title, 256),
+                Limit(description, 4000),
+                color),
+                false);
         }
 
         public void QueueText(ulong channelId, string content)
@@ -86,8 +107,7 @@ namespace SmokyPluginV2.Discord
             if (channelId == 0 || disposed || string.IsNullOrWhiteSpace(content))
                 return;
 
-            string safeContent = Limit(content, 1990);
-            RunDetached(channelId, () => SendTextInternalAsync(channelId, safeContent, cancellation.Token));
+            EnqueueOutbound(OutboundMessage.Text(channelId, Limit(content, 1990)), false);
         }
 
         public void QueuePriorityText(ulong channelId, string content)
@@ -95,8 +115,7 @@ namespace SmokyPluginV2.Discord
             if (channelId == 0 || disposed || string.IsNullOrWhiteSpace(content))
                 return;
 
-            string safeContent = Limit(content, 1990);
-            RunDetached(channelId, () => SendTextInternalAsync(channelId, safeContent, cancellation.Token));
+            EnqueueOutbound(OutboundMessage.Text(channelId, Limit(content, 1990)), true);
         }
 
         public void UpdatePresence(int players, int maxPlayers)
@@ -169,6 +188,13 @@ namespace SmokyPluginV2.Discord
 
             disposed = true;
             cancellation.Cancel();
+            try
+            {
+                outboundSignal.Release();
+            }
+            catch (SemaphoreFullException)
+            {
+            }
             IsReady = false;
 
             try
@@ -666,62 +692,147 @@ namespace SmokyPluginV2.Discord
             }
         }
 
-        private void RunDetached(ulong channelId, Func<Task> work)
+        private void EnqueueOutbound(OutboundMessage message, bool priority)
         {
-            Task.Run(async () =>
+            lock (restRateLimitLock)
+            {
+                if (blockedMessageChannels.Contains(message.ChannelId))
+                    return;
+            }
+
+            int queued = Interlocked.Increment(ref queuedMessages);
+            if (queued > MaxQueuedMessages)
+            {
+                Interlocked.Decrement(ref queuedMessages);
+                int dropped = Interlocked.Increment(ref droppedMessages);
+                if (dropped == 1 || dropped % 100 == 0)
+                    Log.Warn($"[Discord] Outbound log queue is full. {dropped} message(s) will be represented by a later summary.");
+
+                return;
+            }
+
+            if (priority)
+                priorityOutbound.Enqueue(message);
+            else
+                normalOutbound.Enqueue(message);
+
+            outboundSignal.Release();
+        }
+
+        private async Task ProcessOutboundQueueAsync(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested)
             {
                 try
                 {
-                    await work().ConfigureAwait(false);
+                    await outboundSignal.WaitAsync(token).ConfigureAwait(false);
+                    if (!TryDequeueOutbound(out OutboundMessage message, out bool priority))
+                        continue;
+
+                    List<OutboundMessage> batch = new List<OutboundMessage> { message };
+                    if (!priority && message.IsEmbed)
+                    {
+                        int embedCharacters = (message.Title?.Length ?? 0) + (message.Content?.Length ?? 0);
+                        while (batch.Count < 10 && normalOutbound.TryPeek(out OutboundMessage next) &&
+                               next.IsEmbed && next.ChannelId == message.ChannelId)
+                        {
+                            int nextCharacters = (next.Title?.Length ?? 0) + (next.Content?.Length ?? 0);
+                            if (embedCharacters + nextCharacters > 5800 || !normalOutbound.TryDequeue(out next))
+                                break;
+
+                            outboundSignal.Wait(0);
+                            Interlocked.Decrement(ref queuedMessages);
+                            batch.Add(next);
+                            embedCharacters += nextCharacters;
+                        }
+                    }
+
+                    await SendMessagePayloadAsync(message.ChannelId, BuildPayload(batch), token).ConfigureAwait(false);
+                    QueueDroppedMessageSummaryIfReady();
                 }
-                catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
                 {
                 }
                 catch (Exception exception)
                 {
-                    Log.Error($"[Discord] Failed to send a message to channel {channelId}: {exception}");
+                    Log.Error($"[Discord] Outbound message worker recovered from an error: {exception}");
                 }
-            });
+            }
         }
 
-        private async Task SendEmbedInternalAsync(ulong channelId, string title, string description, int color, CancellationToken token)
+        private bool TryDequeueOutbound(out OutboundMessage message, out bool priority)
         {
+            if (priorityOutbound.TryDequeue(out message))
+            {
+                priority = true;
+                Interlocked.Decrement(ref queuedMessages);
+                return true;
+            }
+
+            if (normalOutbound.TryDequeue(out message))
+            {
+                priority = false;
+                Interlocked.Decrement(ref queuedMessages);
+                return true;
+            }
+
+            priority = false;
+            return false;
+        }
+
+        private void QueueDroppedMessageSummaryIfReady()
+        {
+            if (Volatile.Read(ref queuedMessages) >= MaxQueuedMessages / 2)
+                return;
+
+            int dropped = Interlocked.Exchange(ref droppedMessages, 0);
+            if (dropped <= 0 || settings.RemoteAdminChannelId == 0)
+                return;
+
+            EnqueueOutbound(
+                OutboundMessage.Text(
+                    settings.RemoteAdminChannelId,
+                    $"⚠️ Во время всплеска логов очередь объединила {dropped} избыточных сообщений. Сервер и Discord rate limit защищены."),
+                true);
+        }
+
+        private static Dictionary<string, object> BuildPayload(IReadOnlyList<OutboundMessage> messages)
+        {
+            OutboundMessage first = messages[0];
             Dictionary<string, object> payload = new Dictionary<string, object>
             {
-                ["embeds"] = new object[]
-                {
-                    new Dictionary<string, object>
-                    {
-                        ["title"] = title,
-                        ["description"] = description,
-                        ["color"] = color,
-                        ["timestamp"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture),
-                        ["footer"] = new Dictionary<string, object>
-                        {
-                            ["text"] = "SmokyPluginV2",
-                        },
-                    },
-                },
                 ["allowed_mentions"] = new Dictionary<string, object>
                 {
                     ["parse"] = new object[0],
                 },
             };
 
-            await SendMessagePayloadAsync(channelId, payload, token).ConfigureAwait(false);
-        }
-
-        private Task SendTextInternalAsync(ulong channelId, string content, CancellationToken token) => SendMessagePayloadAsync(
-            channelId,
-            new Dictionary<string, object>
+            if (!first.IsEmbed)
             {
-                ["content"] = content,
-                ["allowed_mentions"] = new Dictionary<string, object>
+                payload["content"] = first.Content;
+                return payload;
+            }
+
+            object[] embeds = new object[messages.Count];
+            for (int index = 0; index < messages.Count; index++)
+            {
+                OutboundMessage message = messages[index];
+                embeds[index] = new Dictionary<string, object>
                 {
-                    ["parse"] = new object[0],
-                },
-            },
-            token);
+                    ["title"] = message.Title,
+                    ["description"] = message.Content,
+                    ["color"] = message.Color,
+                    ["timestamp"] = message.CreatedAtUtc.ToString("o", CultureInfo.InvariantCulture),
+                    ["footer"] = new Dictionary<string, object>
+                    {
+                        ["text"] = "SmokyPluginV2",
+                    },
+                };
+            }
+
+            payload["embeds"] = embeds;
+            return payload;
+        }
 
         private async Task SendMessagePayloadAsync(
             ulong channelId,
@@ -739,6 +850,9 @@ namespace SmokyPluginV2.Discord
             Dictionary<string, object> payload,
             CancellationToken token)
         {
+            if (IsMessageChannelBlocked(channelId))
+                return;
+
             string json = Json.Serialize(payload);
             int transientFailures = 0;
 
@@ -753,20 +867,17 @@ namespace SmokyPluginV2.Discord
                         using (HttpResponseMessage response = await SendWithHardTimeoutAsync(request, token).ConfigureAwait(false))
                         {
                             if (response.IsSuccessStatusCode)
+                            {
+                                await WaitForExhaustedMessageBucketAsync(response, token).ConfigureAwait(false);
                                 return;
+                            }
 
                             string responseText = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
                             if ((int)response.StatusCode == 429)
                             {
-                                Dictionary<string, object> rateLimit = Json.DeserializeObject(responseText);
-                                double retrySeconds = rateLimit != null && rateLimit.TryGetValue("retry_after", out object retry)
-                                    ? Convert.ToDouble(retry, CultureInfo.InvariantCulture)
-                                    : 1d;
-
+                                double retrySeconds = GetRemainingRestDelaySeconds();
                                 NotifyRateLimit(channelId, retrySeconds);
-                                AddRateLimitNotice(payload, retrySeconds);
-                                json = Json.Serialize(payload);
-                                await Task.Delay(TimeSpan.FromSeconds(Math.Max(0.1d, retrySeconds)), token).ConfigureAwait(false);
+                                await WaitForRestWindowAsync(token).ConfigureAwait(false);
                                 continue;
                             }
 
@@ -777,6 +888,25 @@ namespace SmokyPluginV2.Discord
 
                                 await Task.Delay(TimeSpan.FromMilliseconds(500 * transientFailures), token).ConfigureAwait(false);
                                 continue;
+                            }
+
+                            if ((int)response.StatusCode == 401)
+                            {
+                                BlockRestRequests(ConfirmedGlobalRateLimitCooldownSeconds);
+                                Log.Error("[Discord] REST authorization was rejected. All Discord REST requests are paused for one hour to prevent an invalid-request ban.");
+                                return;
+                            }
+
+                            if ((int)response.StatusCode == 403 || (int)response.StatusCode == 404)
+                            {
+                                BlockMessageChannel(channelId, response.StatusCode, responseText);
+                                return;
+                            }
+
+                            if ((int)response.StatusCode >= 400 && (int)response.StatusCode < 500)
+                            {
+                                BlockMessageChannel(channelId, response.StatusCode, responseText);
+                                return;
                             }
 
                             throw new InvalidOperationException($"Discord returned {(int)response.StatusCode}: {responseText}");
@@ -798,28 +928,211 @@ namespace SmokyPluginV2.Discord
             }
         }
 
+        private static async Task WaitForExhaustedMessageBucketAsync(HttpResponseMessage response, CancellationToken token)
+        {
+            if (!TryGetRateLimitHeader(response, "X-RateLimit-Remaining", out double remaining) || remaining > 0 ||
+                !TryGetRateLimitHeader(response, "X-RateLimit-Reset-After", out double resetAfter) || resetAfter <= 0)
+            {
+                return;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(resetAfter + 0.1d), token).ConfigureAwait(false);
+        }
+
+        private static bool TryGetRateLimitHeader(HttpResponseMessage response, string name, out double value)
+        {
+            value = 0;
+            if (response?.Headers is null || !response.Headers.TryGetValues(name, out IEnumerable<string> values))
+                return false;
+
+            string raw = null;
+            foreach (string candidate in values)
+            {
+                raw = candidate;
+                break;
+            }
+
+            return double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out value);
+        }
+
         private async Task<HttpResponseMessage> SendWithHardTimeoutAsync(
             HttpRequestMessage request,
             CancellationToken token,
             int timeoutSeconds = 10)
         {
-            using (CancellationTokenSource requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(token))
+            await restRequestLock.WaitAsync(token).ConfigureAwait(false);
+            try
             {
-                Task<HttpResponseMessage> sendTask = httpClient.SendAsync(
-                    request,
-                    HttpCompletionOption.ResponseHeadersRead,
-                    requestCancellation.Token);
-                Task timeoutTask = Task.Delay(TimeSpan.FromSeconds(timeoutSeconds), token);
-                Task completed = await Task.WhenAny(sendTask, timeoutTask).ConfigureAwait(false);
+                await WaitForRestWindowAsync(token).ConfigureAwait(false);
 
-                if (completed == sendTask)
-                    return await sendTask.ConfigureAwait(false);
+                using (CancellationTokenSource requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(token))
+                {
+                    Task<HttpResponseMessage> sendTask = httpClient.SendAsync(
+                        request,
+                        HttpCompletionOption.ResponseHeadersRead,
+                        requestCancellation.Token);
+                    Task timeoutTask = Task.Delay(TimeSpan.FromSeconds(timeoutSeconds), token);
+                    Task completed = await Task.WhenAny(sendTask, timeoutTask).ConfigureAwait(false);
 
-                requestCancellation.Cancel();
-                ObserveAbandonedRequest(sendTask);
-                token.ThrowIfCancellationRequested();
-                throw new TimeoutException($"Discord HTTP request exceeded the hard {timeoutSeconds}-second timeout.");
+                    if (completed == sendTask)
+                    {
+                        HttpResponseMessage response = await sendTask.ConfigureAwait(false);
+                        lock (restRateLimitLock)
+                            nextRestRequestUtc = DateTime.UtcNow.AddMilliseconds(SafeRestIntervalMilliseconds);
+
+                        if ((int)response.StatusCode == 429)
+                            await ApplyGlobalRateLimitAsync(response).ConfigureAwait(false);
+                        else
+                            Interlocked.Exchange(ref consecutiveMissingRetryAfterResponses, 0);
+
+                        return response;
+                    }
+
+                    requestCancellation.Cancel();
+                    ObserveAbandonedRequest(sendTask);
+                    token.ThrowIfCancellationRequested();
+                    throw new TimeoutException($"Discord HTTP request exceeded the hard {timeoutSeconds}-second timeout.");
+                }
             }
+            finally
+            {
+                restRequestLock.Release();
+            }
+        }
+
+        private async Task WaitForRestWindowAsync(CancellationToken token)
+        {
+            while (true)
+            {
+                TimeSpan delay;
+                lock (restRateLimitLock)
+                {
+                    DateTime allowedAt = restBlockedUntilUtc > nextRestRequestUtc ? restBlockedUntilUtc : nextRestRequestUtc;
+                    delay = allowedAt - DateTime.UtcNow;
+                }
+
+                if (delay <= TimeSpan.Zero)
+                    return;
+
+                await Task.Delay(delay, token).ConfigureAwait(false);
+            }
+        }
+
+        private async Task ApplyGlobalRateLimitAsync(HttpResponseMessage response)
+        {
+            string responseText = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            double retrySeconds = GetRetryAfterSeconds(
+                response,
+                responseText,
+                out bool suppliedByDiscord,
+                out bool confirmedGlobalBlock,
+                out int fallbackAttempt);
+            BlockRestRequests(retrySeconds);
+
+            response.Content.Dispose();
+            response.Content = new StringContent(responseText ?? string.Empty, Encoding.UTF8, "application/json");
+
+            if (confirmedGlobalBlock)
+            {
+                Log.Error("[Discord] Discord confirmed a temporary global API block without Retry-After. All REST traffic is paused for one hour.");
+            }
+            else if (!suppliedByDiscord)
+            {
+                Log.Warn($"[Discord] Discord returned 429 without Retry-After. All REST traffic is paused for {Math.Ceiling(retrySeconds):0}s (fallback attempt {fallbackAttempt}).");
+            }
+        }
+
+        private void BlockRestRequests(double retrySeconds)
+        {
+            DateTime blockedUntil = DateTime.UtcNow.AddSeconds(Math.Max(0.25d, retrySeconds) + 0.25d);
+            lock (restRateLimitLock)
+            {
+                if (blockedUntil > restBlockedUntilUtc)
+                    restBlockedUntilUtc = blockedUntil;
+            }
+        }
+
+        private double GetRemainingRestDelaySeconds()
+        {
+            lock (restRateLimitLock)
+                return Math.Max(0.1d, (restBlockedUntilUtc - DateTime.UtcNow).TotalSeconds);
+        }
+
+        private double GetRetryAfterSeconds(
+            HttpResponseMessage response,
+            string responseText,
+            out bool suppliedByDiscord,
+            out bool confirmedGlobalBlock,
+            out int fallbackAttempt)
+        {
+            suppliedByDiscord = false;
+            confirmedGlobalBlock = false;
+            fallbackAttempt = 0;
+            try
+            {
+                Dictionary<string, object> rateLimit = Json.DeserializeObject(responseText);
+                if (rateLimit != null && rateLimit.TryGetValue("retry_after", out object retry))
+                {
+                    double seconds = Convert.ToDouble(retry, CultureInfo.InvariantCulture);
+                    if (seconds >= 0)
+                    {
+                        suppliedByDiscord = true;
+                        Interlocked.Exchange(ref consecutiveMissingRetryAfterResponses, 0);
+                        return Math.Max(0.1d, seconds);
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            if (response?.Headers?.RetryAfter?.Delta is TimeSpan delta && delta >= TimeSpan.Zero)
+            {
+                suppliedByDiscord = true;
+                Interlocked.Exchange(ref consecutiveMissingRetryAfterResponses, 0);
+                return Math.Max(0.1d, delta.TotalSeconds);
+            }
+
+            if (response?.Headers?.RetryAfter?.Date is DateTimeOffset date)
+            {
+                suppliedByDiscord = true;
+                Interlocked.Exchange(ref consecutiveMissingRetryAfterResponses, 0);
+                return Math.Max(0.1d, (date - DateTimeOffset.UtcNow).TotalSeconds);
+            }
+
+            if (IsConfirmedGlobalApiBlock(responseText))
+            {
+                confirmedGlobalBlock = true;
+                Interlocked.Exchange(ref consecutiveMissingRetryAfterResponses, 0);
+                return ConfirmedGlobalRateLimitCooldownSeconds;
+            }
+
+            fallbackAttempt = Interlocked.Increment(ref consecutiveMissingRetryAfterResponses);
+            int exponent = Math.Min(fallbackAttempt - 1, 4);
+            return Math.Min(
+                MissingRetryAfterMaximumCooldownSeconds,
+                MissingRetryAfterInitialCooldownSeconds * (1 << exponent));
+        }
+
+        private static bool IsConfirmedGlobalApiBlock(string responseText) =>
+            !string.IsNullOrWhiteSpace(responseText) &&
+            responseText.IndexOf("being blocked from accessing our API temporarily", StringComparison.OrdinalIgnoreCase) >= 0 &&
+            responseText.IndexOf("global rate limits", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        private bool IsMessageChannelBlocked(ulong channelId)
+        {
+            lock (restRateLimitLock)
+                return blockedMessageChannels.Contains(channelId);
+        }
+
+        private void BlockMessageChannel(ulong channelId, HttpStatusCode statusCode, string responseText)
+        {
+            bool added;
+            lock (restRateLimitLock)
+                added = blockedMessageChannels.Add(channelId);
+
+            if (added)
+                Log.Error($"[Discord] Channel {channelId} rejected log delivery with {(int)statusCode}. Further messages to this channel are disabled until restart: {responseText}");
         }
 
         private static void ObserveAbandonedRequest(Task<HttpResponseMessage> sendTask)
@@ -869,6 +1182,37 @@ namespace SmokyPluginV2.Discord
             public bool IsBypassed(Uri host) => true;
         }
 
+        private sealed class OutboundMessage
+        {
+            private OutboundMessage(ulong channelId, string title, string content, int color, bool isEmbed)
+            {
+                ChannelId = channelId;
+                Title = title;
+                Content = content;
+                Color = color;
+                IsEmbed = isEmbed;
+                CreatedAtUtc = DateTime.UtcNow;
+            }
+
+            public ulong ChannelId { get; }
+
+            public string Title { get; }
+
+            public string Content { get; }
+
+            public int Color { get; }
+
+            public bool IsEmbed { get; }
+
+            public DateTime CreatedAtUtc { get; }
+
+            public static OutboundMessage Embed(ulong channelId, string title, string description, int color) =>
+                new OutboundMessage(channelId, title, description, color, true);
+
+            public static OutboundMessage Text(ulong channelId, string content) =>
+                new OutboundMessage(channelId, null, content, 0, false);
+        }
+
         private void NotifyRateLimit(ulong channelId, double retrySeconds)
         {
             DateTime now = DateTime.UtcNow;
@@ -884,24 +1228,7 @@ namespace SmokyPluginV2.Discord
                 return;
 
             int waitSeconds = Math.Max(1, (int)Math.Ceiling(retrySeconds));
-            string notice = $"⚠️ Discord ограничил отправку сообщений в канал <#{channelId}>. Ожидание: {waitSeconds} сек.";
-            Log.Warn($"[Discord] Rate limit for channel {channelId}: retry after {waitSeconds}s.");
-
-            if (settings.RemoteAdminChannelId != 0 && settings.RemoteAdminChannelId != channelId)
-                QueuePriorityText(settings.RemoteAdminChannelId, notice);
-        }
-
-        private static void AddRateLimitNotice(Dictionary<string, object> payload, double retrySeconds)
-        {
-            if (!payload.TryGetValue("content", out object contentValue) || !(contentValue is string content))
-                return;
-
-            const string marker = "⏳ Ответ был задержан Discord rate limit";
-            if (content.StartsWith(marker, StringComparison.Ordinal))
-                return;
-
-            int waitSeconds = Math.Max(1, (int)Math.Ceiling(retrySeconds));
-            payload["content"] = Limit($"{marker} на {waitSeconds} сек.\n{content}", 1990);
+            Log.Warn($"[Discord] Rate limit for channel {channelId}: all REST requests paused for {waitSeconds}s.");
         }
 
         private static ulong ParseSnowflake(Dictionary<string, object> source, string key)

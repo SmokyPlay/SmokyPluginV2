@@ -3,6 +3,7 @@ namespace SmokyPluginV2.Discord
     using System;
     using System.Collections.Concurrent;
     using System.Collections.Generic;
+    using System.Linq;
     using System.Reflection;
     using System.Text;
     using System.Threading;
@@ -26,15 +27,16 @@ namespace SmokyPluginV2.Discord
             null);
 
         internal const int GameColor = 0x2ECC71;
-        internal const int CommandColor = 0x3498DB;
         internal const int ModerationColor = 0xE67E22;
         internal const int PunishmentColor = 0xE74C3C;
 
         private readonly DiscordSettings settings;
         private readonly DiscordBotClient client;
         private readonly ConcurrentQueue<string> gameLines = new ConcurrentQueue<string>();
+        private readonly ConcurrentQueue<string> remoteAdminLines = new ConcurrentQueue<string>();
         private readonly ConcurrentDictionary<string, string> synchronizedGroups = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private readonly object gameFlushLock = new object();
+        private readonly object remoteAdminFlushLock = new object();
         private Timer statusTimer;
         private Timer gameFlushTimer;
         private bool disposed;
@@ -58,7 +60,7 @@ namespace SmokyPluginV2.Discord
 
             int interval = Math.Max(5, settings.StatusUpdateInterval);
             statusTimer = new Timer(_ => UpdatePresence(), null, TimeSpan.Zero, TimeSpan.FromSeconds(interval));
-            gameFlushTimer = new Timer(_ => FlushGameLines(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+            gameFlushTimer = new Timer(_ => FlushBufferedLines(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
         }
 
         public void LogGameLine(string message)
@@ -93,7 +95,17 @@ namespace SmokyPluginV2.Discord
             LogGameLine(message);
         }
 
-        public void LogRemoteAdmin(string title, string description) => client.QueueEmbed(settings.RemoteAdminChannelId, title, description, CommandColor);
+        public void LogRemoteAdminCommand(string nickname, string senderId, string role, string command, string arguments)
+        {
+            if (settings.RemoteAdminChannelId == 0 || string.IsNullOrWhiteSpace(command))
+                return;
+
+            string line = $"[{DateTime.Now:HH:mm:ss}] ⌨️ {Escape(nickname)} ({Escape(senderId)}) [{Escape(role)}] used command: {Escape(command)}";
+            if (!string.IsNullOrWhiteSpace(arguments))
+                line += $" {Escape(arguments)}";
+
+            remoteAdminLines.Enqueue(line);
+        }
 
         public bool LogModeration(string title, string description, bool isPunishment = true)
         {
@@ -130,7 +142,7 @@ namespace SmokyPluginV2.Discord
             statusTimer = null;
             gameFlushTimer?.Dispose();
             gameFlushTimer = null;
-            FlushGameLines();
+            FlushBufferedLines();
             client.PrefixedMessageReceived -= OnPrefixedMessageReceived;
             client.InteractionReceived -= OnInteractionReceived;
             client.Dispose();
@@ -321,6 +333,21 @@ namespace SmokyPluginV2.Discord
                         MainThreadDispatcher.DispatchTime.FixedUpdate);
                 }
             });
+        }
+
+        internal void ReloadRoleGroupMappings(DiscordSettings reloadedSettings)
+        {
+            if (disposed || reloadedSettings is null)
+                return;
+
+            settings.RoleGroups = reloadedSettings.RoleGroups ?? new List<DiscordRoleGroupMapping>();
+            int validMappings = settings.RoleGroups.Count(mapping =>
+                mapping != null &&
+                mapping.DiscordRoleId != 0 &&
+                !string.IsNullOrWhiteSpace(mapping.RemoteAdminGroup));
+
+            Log.Info($"[AccountLinks] Reloaded {validMappings} Discord-to-Remote-Admin role mapping(s) from plugin configuration.");
+            RefreshLinkedPlayerGroups();
         }
 
         private async Task<DiscordGuildMemberResult> GetGuildMemberResultAsync(ulong discordUserId)
@@ -583,6 +610,43 @@ namespace SmokyPluginV2.Discord
                 if (message.Length > 0)
                     client.QueueText(settings.GameEventsChannelId, message.ToString());
             }
+        }
+
+        private void FlushRemoteAdminLines()
+        {
+            if (settings.RemoteAdminChannelId == 0 || remoteAdminLines.IsEmpty)
+                return;
+
+            lock (remoteAdminFlushLock)
+            {
+                StringBuilder message = new StringBuilder(1900);
+                while (remoteAdminLines.TryDequeue(out string line))
+                {
+                    if (line.Length > 1900)
+                        line = line.Substring(0, 1899) + "…";
+
+                    int required = line.Length + (message.Length > 0 ? 1 : 0);
+                    if (message.Length > 0 && message.Length + required > 1900)
+                    {
+                        client.QueueText(settings.RemoteAdminChannelId, message.ToString());
+                        message.Clear();
+                    }
+
+                    if (message.Length > 0)
+                        message.AppendLine();
+
+                    message.Append(line);
+                }
+
+                if (message.Length > 0)
+                    client.QueueText(settings.RemoteAdminChannelId, message.ToString());
+            }
+        }
+
+        private void FlushBufferedLines()
+        {
+            FlushGameLines();
+            FlushRemoteAdminLines();
         }
     }
 }

@@ -32,18 +32,20 @@ namespace SmokyPluginV2.Patches
 
             string[] parts = query.Trim().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
             string command = parts.Length > 0 ? parts[0] : "unknown";
-            string arguments = parts.Length > 1 ? string.Join(" ", parts.Skip(1)) : "—";
+            string arguments = parts.Length > 1 ? string.Join(" ", parts.Skip(1)) : string.Empty;
 
             if (IsSensitive(command))
                 arguments = "[аргументы скрыты]";
 
             Player player = Player.Get(sender);
-            string role = player is null ? "сервер/внешний отправитель" : player.Role.Type.ToString();
-            string executor = $"**{DiscordLogService.Escape(sender?.Nickname ?? "Dedicated Server")}** (`{DiscordLogService.Escape(sender?.SenderId ?? "server")}`)";
+            string role = player is null ? "None" : player.Role.Type.ToString();
 
-            logs.LogRemoteAdmin(
-                $"Remote Admin: {DiscordLogService.Escape(command)}",
-                $"**Исполнитель:** {executor}\n**Игровая роль:** `{role}`\n**Команда:** `{DiscordLogService.Escape(command)}`\n**Аргументы:** {DiscordLogService.Escape(arguments)}");
+            logs.LogRemoteAdminCommand(
+                sender?.Nickname ?? "Dedicated Server",
+                sender?.SenderId ?? "server",
+                role,
+                command,
+                arguments);
         }
 
         [HarmonyFinalizer]

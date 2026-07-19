@@ -30,11 +30,11 @@ namespace SmokyPluginV2.RolePreferences
 
         private readonly RolePreferenceService owner;
         private readonly RolePreferenceTowerSettings settings;
-        private readonly Dictionary<ReferenceHub, ParticipantState> participants = new Dictionary<ReferenceHub, ParticipantState>();
+        private readonly Dictionary<ReferenceHub, ParticipantState> participants = new Dictionary<ReferenceHub, ParticipantState>(ReferenceHubReferenceComparer.Instance);
         private readonly Dictionary<RolePreferenceCategory, Vector3> zonePositions = new Dictionary<RolePreferenceCategory, Vector3>();
-        private readonly HashSet<ReferenceHub> eventBriefingMutedPlayers = new HashSet<ReferenceHub>();
+        private readonly HashSet<ReferenceHub> eventBriefingMutedPlayers = new HashSet<ReferenceHub>(ReferenceHubReferenceComparer.Instance);
         private readonly List<ExiledToy> toys = new List<ExiledToy>();
-        private Dictionary<ReferenceHub, double> probabilities = new Dictionary<ReferenceHub, double>();
+        private Dictionary<ReferenceHub, double> probabilities = new Dictionary<ReferenceHub, double>(ReferenceHubReferenceComparer.Instance);
         private CoroutineHandle loop;
         private bool loopRunning;
         private bool lobbyActive;
@@ -47,6 +47,7 @@ namespace SmokyPluginV2.RolePreferences
         private Vector3 randomSelectionCenter;
         private bool randomSelectionCenterSet;
         private float nextHintAt;
+        private float nextLoopErrorLogAt;
         private bool eventBriefingActive;
 
         public RolePreferenceTowerService(RolePreferenceService owner, RolePreferenceTowerSettings settings)
@@ -130,11 +131,11 @@ namespace SmokyPluginV2.RolePreferences
 
         public void Stage(Player player)
         {
-            if (!lobbyActive || player is null || !player.IsConnected)
+            if (!lobbyActive || player is null)
                 return;
 
             ReferenceHub hub = player.ReferenceHub;
-            if (hub is null)
+            if (!IsLiveHub(hub) || !player.IsConnected)
                 return;
 
             if (!participants.TryGetValue(hub, out ParticipantState state))
@@ -168,7 +169,10 @@ namespace SmokyPluginV2.RolePreferences
 
             if (participants.Remove(hub))
                 probabilityDirty = true;
+
             probabilities.Remove(hub);
+            eventBriefingMutedPlayers.Remove(hub);
+            owner.ForgetTowerSelection(hub);
         }
 
         public void MarkProbabilityDirty() => probabilityDirty = true;
@@ -203,39 +207,85 @@ namespace SmokyPluginV2.RolePreferences
         {
             while (lobbyActive)
             {
-                foreach (Player player in Player.List.ToList())
-                    Stage(player);
-
-                float now = Time.realtimeSinceStartup;
-                TryCreateMarkers(now);
-                foreach (KeyValuePair<ReferenceHub, ParticipantState> pair in participants.ToList())
+                try
                 {
-                    Player player = Player.Get(pair.Key);
-                    if (player is null || !player.IsConnected)
-                    {
-                        Remove(pair.Key);
-                        continue;
-                    }
-
-                    UpdateSelection(player);
+                    RunLobbyTick();
                 }
-
-                if (now >= nextHintAt)
+                catch (Exception exception)
                 {
-                    RefreshProbabilities();
-                    foreach (ReferenceHub hub in participants.Keys.ToList())
-                    {
-                        Player player = Player.Get(hub);
-                        if (player is not null && player.IsConnected)
-                            ShowHint(player);
-                    }
+                    probabilityDirty = true;
+                    nextHintAt = 0;
 
-                    nextHintAt = now + HintInterval;
+                    float now = Time.realtimeSinceStartup;
+                    if (now >= nextLoopErrorLogAt)
+                    {
+                        nextLoopErrorLogAt = now + 5f;
+                        Log.Error($"[Role Preferences] Tower lobby tick failed but the update loop was kept alive:\n{exception}");
+                    }
                 }
 
                 yield return Timing.WaitForSeconds(LoopInterval);
             }
         }
+
+        private void RunLobbyTick()
+        {
+            PruneInvalidParticipants();
+
+            foreach (Player player in Player.List.ToList())
+                Stage(player);
+
+            float now = Time.realtimeSinceStartup;
+            TryCreateMarkers(now);
+            foreach (KeyValuePair<ReferenceHub, ParticipantState> pair in participants.ToList())
+            {
+                if (!IsLiveHub(pair.Key))
+                {
+                    Remove(pair.Key);
+                    continue;
+                }
+
+                Player player = Player.Get(pair.Key);
+                if (player is null || !player.IsConnected)
+                {
+                    Remove(pair.Key);
+                    continue;
+                }
+
+                UpdateSelection(player);
+            }
+
+            if (now < nextHintAt)
+                return;
+
+            RefreshProbabilities();
+            foreach (ReferenceHub hub in participants.Keys.ToList())
+            {
+                if (!IsLiveHub(hub))
+                {
+                    Remove(hub);
+                    continue;
+                }
+
+                Player player = Player.Get(hub);
+                if (player is not null && player.IsConnected)
+                    ShowHint(player);
+            }
+
+            nextHintAt = now + HintInterval;
+        }
+
+        private void PruneInvalidParticipants()
+        {
+            foreach (ReferenceHub hub in participants.Keys.ToList())
+            {
+                if (!IsLiveHub(hub))
+                    Remove(hub);
+            }
+        }
+
+        private static bool IsLiveHub(ReferenceHub hub) =>
+            hub != null && ReferenceHub.AllHubs.Contains(hub);
 
         private void UpdateSelection(Player player)
         {

@@ -139,6 +139,7 @@
     <Compile Include="Plugin.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="RolePreferences\RoleAssignmentAccess.cs" />
+    <Compile Include="RolePreferences\ReferenceHubReferenceComparer.cs" />
     <Compile Include="RolePreferences\RolePreferencePatches.cs" />
     <Compile Include="RolePreferences\RolePreferenceSelection.cs" />
     <Compile Include="RolePreferences\RolePreferenceService.cs" />

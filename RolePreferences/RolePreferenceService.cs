@@ -18,8 +18,8 @@ namespace SmokyPluginV2.RolePreferences
 
     internal sealed class RolePreferenceService
     {
-        private readonly Dictionary<ReferenceHub, RolePreferenceSelection> towerSelections = new Dictionary<ReferenceHub, RolePreferenceSelection>();
-        private readonly HashSet<ReferenceHub> reservedHumanPreferenceWinners = new HashSet<ReferenceHub>();
+        private readonly Dictionary<ReferenceHub, RolePreferenceSelection> towerSelections = new Dictionary<ReferenceHub, RolePreferenceSelection>(ReferenceHubReferenceComparer.Instance);
+        private readonly HashSet<ReferenceHub> reservedHumanPreferenceWinners = new HashSet<ReferenceHub>(ReferenceHubReferenceComparer.Instance);
         private readonly Random random = new Random();
         private readonly RolePreferenceSettings settings;
         private readonly RolePreferenceTowerService tower;
@@ -77,6 +77,16 @@ namespace SmokyPluginV2.RolePreferences
             runtimePatchesAvailable = available;
             if (!available)
                 tower?.StopLobby();
+        }
+
+        internal void ResumeLobbyAfterConfigReload()
+        {
+            towerSelections.Clear();
+            reservedHumanPreferenceWinners.Clear();
+            roleAssignmentInProgress = false;
+
+            if (isRegistered && runtimePatchesAvailable && tower is not null && Round.IsLobby)
+                tower.StartLobby();
         }
 
         internal void BeginRoleAssignment()
@@ -303,6 +313,12 @@ namespace SmokyPluginV2.RolePreferences
             return hub is not null && towerSelections.Remove(hub);
         }
 
+        internal void ForgetTowerSelection(ReferenceHub hub)
+        {
+            if (hub is not null)
+                towerSelections.Remove(hub);
+        }
+
         internal RolePreferenceCategory GetTowerSelection(ReferenceHub hub) => GetCategory(hub);
 
         internal double GetTowerWeight(ReferenceHub hub) => GetEffectiveWeight(hub);
@@ -325,7 +341,10 @@ namespace SmokyPluginV2.RolePreferences
                 .Where(hub => hub is not null && Player.Get(hub)?.IsConnected == true)
                 .Distinct()
                 .ToList();
-            Dictionary<ReferenceHub, double> result = players.ToDictionary(player => player, _ => 0d);
+            Dictionary<ReferenceHub, double> result = new Dictionary<ReferenceHub, double>(ReferenceHubReferenceComparer.Instance);
+            foreach (ReferenceHub player in players)
+                result[player] = 0d;
+
             if (players.Count == 0)
                 return result;
 
