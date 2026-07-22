@@ -21,7 +21,7 @@ namespace SmokyPluginV2.Commands
 
         public string[] Aliases => Array.Empty<string>();
 
-        public string Description => "Выдаёт игроку постоянное предупреждение: warn <игрок> <причина>.";
+        public string Description => "Выдаёт игроку постоянное предупреждение: warn [игрок] [причина].";
 
         public bool Execute(ArraySegment<string> arguments, ICommandSender sender, out string response)
         {
@@ -41,7 +41,7 @@ namespace SmokyPluginV2.Commands
 
             if (arguments.Count < 2)
             {
-                response = "Использование: warn <игрок> <причина>";
+                response = "Использование: warn [игрок] [причина]";
                 return false;
             }
 
@@ -113,7 +113,7 @@ namespace SmokyPluginV2.Commands
 
         public string[] Aliases => new[] { "warns" };
 
-        public string Description => "Показывает предупреждения: warnings <игрок|UserId>.";
+        public string Description => "Показывает предупреждения: warnings [игровой ID или SteamID].";
 
         public bool Execute(ArraySegment<string> arguments, ICommandSender sender, out string response)
         {
@@ -141,7 +141,7 @@ namespace SmokyPluginV2.Commands
 
         public string[] Aliases => new[] { "unwarn", "rmwarn" };
 
-        public string Description => "Удаляет предупреждение: delwarn <ID>.";
+        public string Description => "Удаляет предупреждение: delwarn [ID].";
 
         public bool Execute(ArraySegment<string> arguments, ICommandSender sender, out string response)
         {
@@ -161,7 +161,7 @@ namespace SmokyPluginV2.Commands
 
             if (arguments.Count != 1 || !long.TryParse(arguments.Array[arguments.Offset], out long warningId) || warningId <= 0)
             {
-                response = "Использование: delwarn <ID>";
+                response = "Использование: delwarn [ID]";
                 return false;
             }
 

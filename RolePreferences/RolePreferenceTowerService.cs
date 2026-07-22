@@ -138,7 +138,8 @@ namespace SmokyPluginV2.RolePreferences
             if (!IsLiveHub(hub) || !player.IsConnected)
                 return;
 
-            if (!participants.TryGetValue(hub, out ParticipantState state))
+            bool newlyStaged = !participants.TryGetValue(hub, out ParticipantState state);
+            if (newlyStaged)
             {
                 state = new ParticipantState { NativeSpawnReadyAt = Time.realtimeSinceStartup + 0.25f };
                 participants.Add(hub, state);
@@ -146,9 +147,8 @@ namespace SmokyPluginV2.RolePreferences
             }
 
             float now = Time.realtimeSinceStartup;
-            if (player.Role.Type != RoleTypeId.Tutorial && now - state.LastRoleSetAt >= 0.75f)
+            if (newlyStaged && player.Role.Type != RoleTypeId.Tutorial)
             {
-                state.LastRoleSetAt = now;
                 state.NativeSpawnReadyAt = now + 0.5f;
                 player.Role.Set(RoleTypeId.Tutorial);
                 player.ClearInventory();
@@ -666,9 +666,12 @@ namespace SmokyPluginV2.RolePreferences
             pad.Visible = true;
             toys.Add(pad);
 
+            float labelYaw = category == RolePreferenceCategory.ClassD || category == RolePreferenceCategory.FacilityGuard
+                ? 180f
+                : 0f;
             ExiledText label = ExiledText.Create(
                 position + new Vector3(0f, 0.065f, 0f),
-                Quaternion.Euler(90f, 0f, 0f),
+                Quaternion.Euler(90f, labelYaw, 0f),
                 new Vector3(0.18f, 0.18f, 0.18f),
                 $"<color={GetHexColor(category)}><b>{GetDisplayName(category).ToUpperInvariant()}</b></color>",
                 new Vector2(160f, 38f),
@@ -794,8 +797,6 @@ namespace SmokyPluginV2.RolePreferences
 
         private sealed class ParticipantState
         {
-            public float LastRoleSetAt { get; set; } = -10f;
-
             public float NativeSpawnReadyAt { get; set; }
         }
     }

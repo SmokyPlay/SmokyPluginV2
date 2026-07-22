@@ -19,6 +19,8 @@ namespace SmokyPluginV2.Patches
         {
             if (__0 is not null)
             {
+                Plugin.Instance?.Statistics?.OnWaveSpawned(__0);
+
                 string waveType = __0.GetType().Name;
                 bool isMiniWave = waveType.IndexOf("Mini", System.StringComparison.OrdinalIgnoreCase) >= 0;
                 bool isChaos = waveType.IndexOf("Chaos", System.StringComparison.OrdinalIgnoreCase) >= 0;

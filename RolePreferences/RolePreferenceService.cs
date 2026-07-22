@@ -18,6 +18,10 @@ namespace SmokyPluginV2.RolePreferences
 
     internal sealed class RolePreferenceService
     {
+        private const string SpawnQueueConfigKey = "team_respawn_queue";
+        private const string DefaultSpawnQueue = "4014314031441404134041434414";
+        private const string AllowScpOverflowConfigKey = "allow_scp_overflow";
+
         private readonly Dictionary<ReferenceHub, RolePreferenceSelection> towerSelections = new Dictionary<ReferenceHub, RolePreferenceSelection>(ReferenceHubReferenceComparer.Instance);
         private readonly HashSet<ReferenceHub> reservedHumanPreferenceWinners = new HashSet<ReferenceHub>(ReferenceHubReferenceComparer.Instance);
         private readonly Random random = new Random();
@@ -447,7 +451,7 @@ namespace SmokyPluginV2.RolePreferences
             if (playerCount <= 0)
                 return result;
 
-            string configuredQueue = GameCore.ConfigFile.ServerConfig.GetString(RoleAssigner.SpawnQueueKey, RoleAssigner.DefaultQueue);
+            string configuredQueue = GameCore.ConfigFile.ServerConfig.GetString(SpawnQueueConfigKey, DefaultSpawnQueue);
             List<Team> totalQueue = new List<Team>();
             List<Team> humanQueue = new List<Team>();
             foreach (char character in configuredQueue)
@@ -464,7 +468,7 @@ namespace SmokyPluginV2.RolePreferences
             if (totalQueue.Count == 0)
                 return result;
 
-            bool allowOverflow = GameCore.ConfigFile.ServerConfig.GetBool(RoleAssigner.AllowScpOverflowSettingKey);
+            bool allowOverflow = GameCore.ConfigFile.ServerConfig.GetBool(AllowScpOverflowConfigKey);
             int maxScps = ScpSpawner.MaxSpawnableScps;
             for (int index = 0; index < playerCount; index++)
             {

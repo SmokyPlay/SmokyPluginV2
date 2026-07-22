@@ -15,7 +15,7 @@ namespace SmokyPluginV2.Commands
 
         public string[] Aliases => Array.Empty<string>();
 
-        public string Description => "Привязывает игровой аккаунт к Discord: .link <код>.";
+        public string Description => "Привязывает игровой аккаунт к Discord: .link [код].";
 
         public bool Execute(ArraySegment<string> arguments, ICommandSender sender, out string response)
         {
@@ -35,7 +35,7 @@ namespace SmokyPluginV2.Commands
 
             if (arguments.Count != 1)
             {
-                response = "Использование: .link <код из Discord-команды /link>";
+                response = "Использование: .link [код из Discord-команды /link]";
                 return false;
             }
 

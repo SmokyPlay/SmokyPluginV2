@@ -2,6 +2,7 @@ namespace SmokyPluginV2.Patches
 {
     using System;
     using System.Linq;
+    using System.Reflection;
 
     using Exiled.API.Features;
 
@@ -11,13 +12,16 @@ namespace SmokyPluginV2.Patches
 
     using SmokyPluginV2.Discord;
 
-    [HarmonyPatch(typeof(CommandProcessor), nameof(CommandProcessor.ProcessQuery), new[] { typeof(string), typeof(CommandSender) })]
+    [HarmonyPatch]
     internal static class RemoteAdminCommandLoggingPatch
     {
         [ThreadStatic]
         private static CommandSender currentSender;
 
         public static CommandSender CurrentSender => currentSender;
+
+        private static MethodBase TargetMethod() =>
+            AccessTools.Method(typeof(CommandProcessor), "ProcessQuery", new[] { typeof(string), typeof(CommandSender) });
 
         [HarmonyPrefix]
         private static void Prefix(string __0, CommandSender __1)

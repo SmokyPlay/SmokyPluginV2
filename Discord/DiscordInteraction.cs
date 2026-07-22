@@ -10,6 +10,12 @@ namespace SmokyPluginV2.Discord
 
         public ulong UserId { get; set; }
 
+        public ulong TargetDiscordUserId { get; set; }
+
+        public string SteamId { get; set; }
+
+        public string StatisticsVisibility { get; set; }
+
         public string CommandName { get; set; }
     }
 
@@ -17,7 +23,31 @@ namespace SmokyPluginV2.Discord
     {
         public string Content { get; set; }
 
+        public DiscordEmbed Embed { get; set; }
+
         public bool Ephemeral { get; set; } = true;
+    }
+
+    internal sealed class DiscordEmbed
+    {
+        public string Title { get; set; }
+
+        public string Description { get; set; }
+
+        public int Color { get; set; } = 0x5865F2;
+
+        public DiscordEmbedField[] Fields { get; set; } = System.Array.Empty<DiscordEmbedField>();
+
+        public string Footer { get; set; }
+    }
+
+    internal sealed class DiscordEmbedField
+    {
+        public string Name { get; set; }
+
+        public string Value { get; set; }
+
+        public bool Inline { get; set; }
     }
 
     internal sealed class DiscordGuildMemberResult

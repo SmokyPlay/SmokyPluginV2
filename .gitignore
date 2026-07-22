@@ -7,3 +7,8 @@ obj/
 *.pdb
 *.zip
 *.tar.gz
+
+# Runtime database provider shipped with the EXILED plugin.
+!lib/
+!lib/MySqlConnector/
+!lib/MySqlConnector/MySqlConnector.dll

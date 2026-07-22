@@ -16,11 +16,13 @@ namespace SmokyPluginV2.Discord
     using Respawning.Waves;
 
     using SmokyPluginV2.AccountLinks;
+    using SmokyPluginV2.Database;
+    using SmokyPluginV2.Statistics;
 
     internal sealed class DiscordLogService : IDisposable
     {
         private static readonly MethodInfo RemoteAdminProcessQuery = typeof(CommandProcessor).GetMethod(
-            nameof(CommandProcessor.ProcessQuery),
+            "ProcessQuery",
             BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic,
             null,
             new[] { typeof(string), typeof(CommandSender) },
@@ -377,11 +379,97 @@ namespace SmokyPluginV2.Discord
             if (interaction is null || interaction.GuildId != settings.GuildId || interaction.UserId == 0)
                 return Ephemeral("Команда доступна только участникам настроенного Discord-сервера.");
 
+            string commandName = (interaction.CommandName ?? string.Empty).ToLowerInvariant();
+            MariaDbService database = Plugin.Instance?.Database;
+            if (commandName == "server-stats")
+            {
+                if (database == null || Plugin.Instance?.Config?.Statistics?.IsEnabled != true)
+                    return Ephemeral("Статистика сервера сейчас недоступна.");
+                if (!database.TryGetServerStatistics(out ServerStatisticsRecord serverStats, out string serverError))
+                    return Ephemeral("❌ " + serverError);
+                return new DiscordInteractionResponse
+                {
+                    Embed = StatisticsEmbedFormatter.Server(serverStats),
+                    Ephemeral = false,
+                };
+            }
+
             AccountLinkService links = Plugin.Instance?.AccountLinks;
+            if (commandName == "stats-privacy")
+            {
+                if (database == null || Plugin.Instance?.Config?.Statistics?.IsEnabled != true)
+                    return Ephemeral("Статистика игроков сейчас недоступна.");
+
+                string visibility = (interaction.StatisticsVisibility ?? string.Empty).Trim().ToLowerInvariant();
+                if (visibility != "public" && visibility != "private")
+                    return Ephemeral("Выберите открытую или закрытую статистику.");
+
+                bool isPrivate = visibility == "private";
+                if (!database.TrySetStatisticsPrivacy(interaction.UserId, isPrivate, out bool accountLinked, out string privacyError))
+                    return Ephemeral("❌ " + privacyError);
+                if (!accountLinked)
+                    return Ephemeral("Сначала привяжите игровой аккаунт командой `/link`.");
+
+                return isPrivate
+                    ? Ephemeral("🔒 Ваша статистика теперь недоступна другим пользователям. Вы по-прежнему можете просматривать её самостоятельно.")
+                    : Ephemeral("🔓 Ваша статистика теперь доступна другим пользователям.");
+            }
+
+            if (commandName == "stats")
+            {
+                if (database == null || Plugin.Instance?.Config?.Statistics?.IsEnabled != true)
+                    return Ephemeral("Статистика игроков сейчас недоступна.");
+                bool hasDiscord = interaction.TargetDiscordUserId != 0;
+                bool hasSteam = !string.IsNullOrWhiteSpace(interaction.SteamId);
+                if (hasDiscord && hasSteam)
+                    return Ephemeral("Укажите либо Discord-аккаунт, либо Steam ID, но не оба одновременно.");
+
+                string statsUserId;
+                if (hasSteam)
+                {
+                    string steamId = interaction.SteamId.Trim();
+                    if (steamId.Length != 17 || !steamId.All(char.IsDigit) || !ulong.TryParse(steamId, out _))
+                        return Ephemeral("Steam ID должен быть корректным 17-значным SteamID64 без `@steam`.");
+                    statsUserId = steamId;
+                }
+                else
+                {
+                    ulong discordUserId = hasDiscord ? interaction.TargetDiscordUserId : interaction.UserId;
+                    if (!database.TryGetPlayerUserId(discordUserId, out statsUserId, out string statsLinkError))
+                        return Ephemeral("❌ " + statsLinkError);
+                    if (string.IsNullOrWhiteSpace(statsUserId))
+                    {
+                        return hasDiscord
+                            ? Ephemeral("К указанному Discord-аккаунту не привязан Steam ID.")
+                            : Ephemeral("Сначала привяжите игровой аккаунт командой `/link` или укажите `steam_id`.");
+                    }
+                }
+                if (!database.TryGetPlayerStatistics(statsUserId, out PlayerStatisticsRecord playerStats, out string statsError))
+                    return Ephemeral("❌ " + statsError);
+                if (playerStats == null)
+                    return Ephemeral("Для этого аккаунта статистика ещё не записана.");
+
+                if (!database.TryGetPlayerUserId(interaction.UserId, out string requesterUserId, out string requesterError))
+                    return Ephemeral("❌ " + requesterError);
+                bool isOwner = !string.IsNullOrWhiteSpace(requesterUserId) &&
+                    string.Equals(
+                        MariaDbService.NormalizeSteamId(requesterUserId),
+                        MariaDbService.NormalizeSteamId(statsUserId),
+                        StringComparison.Ordinal);
+                if (playerStats.StatisticsPrivate && !isOwner)
+                    return Ephemeral("Этот игрок закрыл доступ к своей статистике.");
+
+                return new DiscordInteractionResponse
+                {
+                    Embed = StatisticsEmbedFormatter.Player(playerStats, database.ServerName),
+                    Ephemeral = false,
+                };
+            }
+
             if (links is null || settings.AccountLinking?.IsEnabled != true)
                 return Ephemeral("Привязка игровых аккаунтов отключена.");
 
-            switch ((interaction.CommandName ?? string.Empty).ToLowerInvariant())
+            switch (commandName)
             {
                 case "link":
                     int lifetimeMinutes = Math.Max(1, Math.Min(60, settings.AccountLinking.CodeLifetimeMinutes));
@@ -463,7 +551,7 @@ namespace SmokyPluginV2.Discord
             try
             {
                 if (RemoteAdminProcessQuery is null)
-                    throw new MissingMethodException(typeof(CommandProcessor).FullName, nameof(CommandProcessor.ProcessQuery));
+                    throw new MissingMethodException(typeof(CommandProcessor).FullName, "ProcessQuery");
 
                 RemoteAdminProcessQuery.Invoke(null, new object[] { message.Content, sender });
             }

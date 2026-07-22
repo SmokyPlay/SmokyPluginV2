@@ -19,6 +19,12 @@ namespace SmokyPluginV2
         [Description("Whether to restart an active round after the last player leaves the server.")]
         public bool RestartEmptyRound { get; set; } = true;
 
+        [Description("MariaDB storage shared by statistics, account links and warnings.")]
+        public DatabaseSettings Database { get; set; } = new DatabaseSettings();
+
+        [Description("Persistent player and server statistics settings.")]
+        public StatisticsSettings Statistics { get; set; } = new StatisticsSettings();
+
         [Description("Settings for enabling friendly fire only after a round has ended.")]
         public EndRoundFriendlyFireSettings EndRoundFriendlyFire { get; set; } = new EndRoundFriendlyFireSettings();
 
@@ -27,6 +33,9 @@ namespace SmokyPluginV2
 
         [Description("Settings for restoring the pink candy to SCP-330's bowl.")]
         public PinkCandySettings PinkCandy { get; set; } = new PinkCandySettings();
+
+        [Description("Settings for a recurring broadcast shown to every connected player.")]
+        public GeneralBroadcastSettings GeneralBroadcast { get; set; } = new GeneralBroadcastSettings();
 
         [Description("Pre-round role preference UI and role assignment settings.")]
         public RolePreferenceSettings RolePreferences { get; set; } = new RolePreferenceSettings();
@@ -39,6 +48,40 @@ namespace SmokyPluginV2
 
         [Description("Individual game events that can be sent to the Discord game-events channel.")]
         public DiscordEventLogs DiscordEventLogs { get; set; } = new DiscordEventLogs();
+    }
+
+    public sealed class DatabaseSettings
+    {
+        [Description("Whether MariaDB persistence is enabled. Warnings, account links and statistics require it.")]
+        public bool IsEnabled { get; set; } = true;
+
+        [Description("Human-readable server name shown in statistics.")]
+        public string ServerName { get; set; } = "Main server";
+
+        [Description("Import legacy account-links.yml and warnings.yml once, then keep the YAML files as untouched backups.")]
+        public bool ImportLegacyYaml { get; set; } = true;
+    }
+
+    public sealed class StatisticsSettings
+    {
+        [Description("Whether player and server statistics are collected during active rounds.")]
+        public bool IsEnabled { get; set; } = true;
+
+    }
+
+    public sealed class GeneralBroadcastSettings
+    {
+        [Description("Whether the recurring server-wide broadcast is enabled.")]
+        public bool IsEnabled { get; set; } = false;
+
+        [Description("Delay in seconds between broadcasts.")]
+        public float IntervalSeconds { get; set; } = 300f;
+
+        [Description("How many seconds each broadcast remains visible.")]
+        public ushort DurationSeconds { get; set; } = 10;
+
+        [Description("Broadcast text. SCP:SL rich-text tags are supported.")]
+        public string Text { get; set; } = "Добро пожаловать на сервер!";
     }
 
     public sealed class EndRoundFriendlyFireSettings

@@ -5,6 +5,7 @@ namespace SmokyPluginV2.Discord
     using System.Collections.Generic;
     using System.Globalization;
     using System.IO;
+    using System.Linq;
     using System.Net;
     using System.Net.Http;
     using System.Net.Http.Headers;
@@ -74,7 +75,7 @@ namespace SmokyPluginV2.Discord
                 Timeout = Timeout.InfiniteTimeSpan,
             };
             httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bot", settings.Token);
-            httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("DiscordBot (https://github.com/SmokyPlay/SmokyPluginV2, 0.15.9)");
+            httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("DiscordBot (https://github.com/SmokyPlay/SmokyPluginV2, 0.18.1)");
         }
 
         public event Action<DiscordMessage> PrefixedMessageReceived;
@@ -434,6 +435,9 @@ namespace SmokyPluginV2.Discord
                 Token = data.TryGetValue("token", out object tokenValue) ? tokenValue as string : null,
                 GuildId = ParseSnowflake(data, "guild_id"),
                 UserId = ParseSnowflake(user, "id"),
+                TargetDiscordUserId = ParseCommandOptionSnowflake(commandData, "discord"),
+                SteamId = ParseCommandOptionString(commandData, "steam_id"),
+                StatisticsVisibility = ParseCommandOptionString(commandData, "доступ"),
                 CommandName = commandData != null && commandData.TryGetValue("name", out object nameValue) ? nameValue as string : null,
             };
 
@@ -470,29 +474,84 @@ namespace SmokyPluginV2.Discord
                     return;
                 }
 
-                object[] commands = settings.AccountLinking?.IsEnabled == true
-                    ? new object[]
-                    {
-                    new Dictionary<string, object>
+                List<object> commandList = new List<object>();
+                if (settings.AccountLinking?.IsEnabled == true)
+                {
+                    commandList.Add(new Dictionary<string, object>
                     {
                         ["name"] = "link",
                         ["description"] = "Получить код привязки игрового аккаунта SCP:SL",
                         ["type"] = 1,
-                    },
-                    new Dictionary<string, object>
+                    });
+                    commandList.Add(new Dictionary<string, object>
                     {
                         ["name"] = "unlink",
                         ["description"] = "Отвязать игровой аккаунт SCP:SL от Discord",
                         ["type"] = 1,
-                    },
-                    new Dictionary<string, object>
+                    });
+                    commandList.Add(new Dictionary<string, object>
                     {
                         ["name"] = "link-status",
                         ["description"] = "Проверить состояние привязки игрового аккаунта",
                         ["type"] = 1,
-                    },
-                    }
-                    : new object[0];
+                    });
+                }
+                if (Plugin.Instance?.Config?.Statistics?.IsEnabled == true && Plugin.Instance.Database != null)
+                {
+                    commandList.Add(new Dictionary<string, object>
+                    {
+                        ["name"] = "stats",
+                        ["description"] = "Показать игровую статистику игрока",
+                        ["type"] = 1,
+                        ["options"] = new object[]
+                        {
+                            new Dictionary<string, object>
+                            {
+                                ["name"] = "discord",
+                                ["description"] = "Можно выбрать Discord-аккаунт другого игрока, если он привязан к Steam-аккаунту",
+                                ["type"] = 6,
+                                ["required"] = false,
+                            },
+                            new Dictionary<string, object>
+                            {
+                                ["name"] = "steam_id",
+                                ["description"] = "Или указать его SteamID64 без @steam",
+                                ["type"] = 3,
+                                ["required"] = false,
+                                ["min_length"] = 17,
+                                ["max_length"] = 17,
+                            },
+                        },
+                    });
+                    commandList.Add(new Dictionary<string, object>
+                    {
+                        ["name"] = "server-stats",
+                        ["description"] = "Показать общую статистику сервера",
+                        ["type"] = 1,
+                    });
+                    commandList.Add(new Dictionary<string, object>
+                    {
+                        ["name"] = "stats-privacy",
+                        ["description"] = "Настроить доступ других пользователей к своей статистике",
+                        ["type"] = 1,
+                        ["options"] = new object[]
+                        {
+                            new Dictionary<string, object>
+                            {
+                                ["name"] = "доступ",
+                                ["description"] = "Выберите, кто сможет просматривать вашу статистику",
+                                ["type"] = 3,
+                                ["required"] = true,
+                                ["choices"] = new object[]
+                                {
+                                    new Dictionary<string, object> { ["name"] = "Открытая", ["value"] = "public" },
+                                    new Dictionary<string, object> { ["name"] = "Закрытая", ["value"] = "private" },
+                                },
+                            },
+                        },
+                    });
+                }
+                object[] commands = commandList.ToArray();
 
                 int failedAttempts = 0;
                 while (!token.IsCancellationRequested)
@@ -510,8 +569,8 @@ namespace SmokyPluginV2.Discord
                                 if (response.IsSuccessStatusCode)
                                 {
                                     Log.Info(commands.Length > 0
-                                        ? "[Discord] Guild slash commands /link, /unlink and /link-status are registered."
-                                        : "[Discord] Account-linking slash commands are disabled and removed from the guild.");
+                                        ? $"[Discord] Registered {commands.Length} guild slash command(s)."
+                                        : "[Discord] Plugin slash commands are disabled and removed from the guild.");
                                     return;
                                 }
 
@@ -566,18 +625,45 @@ namespace SmokyPluginV2.Discord
         {
             try
             {
+                Dictionary<string, object> responseData = new Dictionary<string, object>
+                {
+                    ["flags"] = response?.Ephemeral == false ? 0 : 64,
+                    ["allowed_mentions"] = new Dictionary<string, object>
+                    {
+                        ["parse"] = new object[0],
+                    },
+                };
+                if (!string.IsNullOrWhiteSpace(response?.Content))
+                    responseData["content"] = Limit(response.Content, 1900);
+                if (response?.Embed != null)
+                {
+                    DiscordEmbed embed = response.Embed;
+                    Dictionary<string, object> embedPayload = new Dictionary<string, object>
+                    {
+                        ["title"] = Limit(embed.Title, 256),
+                        ["description"] = Limit(embed.Description, 4096),
+                        ["color"] = embed.Color,
+                        ["fields"] = (embed.Fields ?? Array.Empty<DiscordEmbedField>()).Select(field => new Dictionary<string, object>
+                        {
+                            ["name"] = Limit(field.Name, 256),
+                            ["value"] = Limit(field.Value, 1024),
+                            ["inline"] = field.Inline,
+                        }).ToArray(),
+                    };
+                    if (!string.IsNullOrWhiteSpace(embed.Footer))
+                    {
+                        embedPayload["footer"] = new Dictionary<string, object>
+                        {
+                            ["text"] = Limit(embed.Footer, 2048),
+                        };
+                    }
+                    responseData["embeds"] = new object[] { embedPayload };
+                }
+
                 Dictionary<string, object> payload = new Dictionary<string, object>
                 {
                     ["type"] = 4,
-                    ["data"] = new Dictionary<string, object>
-                    {
-                        ["content"] = Limit(response?.Content, 1900),
-                        ["flags"] = response?.Ephemeral == false ? 0 : 64,
-                        ["allowed_mentions"] = new Dictionary<string, object>
-                        {
-                            ["parse"] = new object[0],
-                        },
-                    },
+                    ["data"] = responseData,
                 };
 
                 using (HttpRequestMessage request = new HttpRequestMessage(
@@ -1237,6 +1323,35 @@ namespace SmokyPluginV2.Discord
                 return id;
 
             return 0;
+        }
+
+        private static ulong ParseCommandOptionSnowflake(Dictionary<string, object> commandData, string optionName)
+        {
+            string value = ParseCommandOptionString(commandData, optionName);
+            return ulong.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out ulong id) ? id : 0;
+        }
+
+        private static string ParseCommandOptionString(Dictionary<string, object> commandData, string optionName)
+        {
+            if (commandData is null || !commandData.TryGetValue("options", out object optionsValue))
+                return null;
+
+            object[] options = Json.Array(optionsValue);
+            if (options is null)
+                return null;
+
+            foreach (object item in options)
+            {
+                Dictionary<string, object> option = Json.Object(item);
+                if (option != null && option.TryGetValue("name", out object nameValue) &&
+                    string.Equals(nameValue as string, optionName, StringComparison.Ordinal) &&
+                    option.TryGetValue("value", out object value))
+                {
+                    return Convert.ToString(value, CultureInfo.InvariantCulture);
+                }
+            }
+
+            return null;
         }
 
         private static ulong[] ParseRoleIds(Dictionary<string, object> member)

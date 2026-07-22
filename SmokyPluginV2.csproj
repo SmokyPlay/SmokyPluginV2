@@ -46,7 +46,13 @@
   <ItemGroup>
     <Reference Include="System" />
     <Reference Include="System.Core" />
+    <Reference Include="System.Data" />
     <Reference Include="System.Net.Http" />
+
+    <Reference Include="MySqlConnector">
+      <HintPath>lib\MySqlConnector\MySqlConnector.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
 
     <Reference Include="YamlDotNet">
       <HintPath>$(GameReferencesPath)\YamlDotNet.dll</HintPath>
@@ -118,17 +124,23 @@
     <Compile Include="Commands\AccountLinkCommands.cs" />
     <Compile Include="Commands\EventLobbyCommand.cs" />
     <Compile Include="Commands\MyWarningsCommand.cs" />
+    <Compile Include="Commands\StatisticsRecordingCommand.cs" />
+    <Compile Include="Commands\StatisticsClearCommand.cs" />
     <Compile Include="Commands\WarningCommands.cs" />
     <Compile Include="Config.cs" />
+    <Compile Include="Database\MariaDbService.cs" />
+    <Compile Include="Database\SharedDatabaseConfig.cs" />
     <Compile Include="Discord\DiscordBotClient.cs" />
     <Compile Include="Discord\DiscordCommandSender.cs" />
     <Compile Include="Discord\DiscordInteraction.cs" />
     <Compile Include="Discord\DiscordLogService.cs" />
     <Compile Include="Discord\DiscordMessage.cs" />
     <Compile Include="Discord\Json.cs" />
+    <Compile Include="Discord\StatisticsEmbedFormatter.cs" />
     <Compile Include="Handlers\DiscordGameEventHandler.cs" />
     <Compile Include="Handlers\DiscordModerationHandler.cs" />
     <Compile Include="Handlers\EmptyRoundHandler.cs" />
+    <Compile Include="Handlers\GeneralBroadcastHandler.cs" />
     <Compile Include="Handlers\EndRoundFriendlyFireHandler.cs" />
     <Compile Include="Handlers\LateJoinSpawnHandler.cs" />
     <Compile Include="Handlers\PinkCandyHandler.cs" />
@@ -144,6 +156,8 @@
     <Compile Include="RolePreferences\RolePreferenceSelection.cs" />
     <Compile Include="RolePreferences\RolePreferenceService.cs" />
     <Compile Include="RolePreferences\RolePreferenceTowerService.cs" />
+    <Compile Include="Statistics\StatisticsModels.cs" />
+    <Compile Include="Statistics\StatisticsService.cs" />
     <Compile Include="Warnings\WarningRecord.cs" />
     <Compile Include="Warnings\WarningService.cs" />
   </ItemGroup>

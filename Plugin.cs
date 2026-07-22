@@ -8,8 +8,10 @@ namespace SmokyPluginV2
     using HarmonyLib;
 
     using SmokyPluginV2.AccountLinks;
+    using SmokyPluginV2.Database;
     using SmokyPluginV2.Discord;
     using SmokyPluginV2.RolePreferences;
+    using SmokyPluginV2.Statistics;
 
     /// <summary>
     /// Main EXILED plugin entry point.
@@ -20,8 +22,11 @@ namespace SmokyPluginV2
         private Handlers.EndRoundFriendlyFireHandler endRoundFriendlyFireHandler;
         private Handlers.LateJoinSpawnHandler lateJoinSpawnHandler;
         private Handlers.PinkCandyHandler pinkCandyHandler;
+        private Handlers.GeneralBroadcastHandler generalBroadcastHandler;
         private RolePreferenceService rolePreferenceService;
         private AccountLinkService accountLinkService;
+        private MariaDbService databaseService;
+        private StatisticsService statisticsService;
         private Handlers.DiscordGameEventHandler discordGameEventHandler;
         private Handlers.DiscordModerationHandler discordModerationHandler;
         private DiscordLogService discordLogService;
@@ -36,6 +41,10 @@ namespace SmokyPluginV2
         internal Warnings.WarningService WarningService => warningService;
 
         internal AccountLinkService AccountLinks => accountLinkService;
+
+        internal MariaDbService Database => databaseService;
+
+        internal StatisticsService Statistics => statisticsService;
 
         internal DiscordLogService DiscordLogs => discordLogService;
 
@@ -53,7 +62,7 @@ namespace SmokyPluginV2
         public override string Author => "Smoky";
 
         /// <inheritdoc />
-        public override Version Version => new(0, 15, 9);
+        public override Version Version => new(0, 18, 1);
 
         /// <inheritdoc />
         public override Version RequiredExiledVersion => new(9, 14, 2);
@@ -63,11 +72,40 @@ namespace SmokyPluginV2
         {
             Instance = this;
 
-            if (Config.Warnings?.IsEnabled == true)
-                warningService = new Warnings.WarningService();
-
-            if (Config.Discord?.AccountLinking?.IsEnabled == true)
-                accountLinkService = new AccountLinkService();
+            if (Config.Database?.IsEnabled == true)
+            {
+                try
+                {
+                    SharedDatabaseSettings sharedDatabaseSettings = SharedDatabaseConfig.Load();
+                    databaseService = new MariaDbService(sharedDatabaseSettings, Config.Database.ServerName);
+                    bool importLegacyYaml = Config.Database.ImportLegacyYaml;
+                    if (Config.Warnings?.IsEnabled == true)
+                        warningService = new Warnings.WarningService(databaseService, importLegacyYaml);
+                    if (Config.Discord?.AccountLinking?.IsEnabled == true)
+                        accountLinkService = new AccountLinkService(databaseService, importLegacyYaml);
+                    if (Config.Statistics?.IsEnabled == true)
+                    {
+                        statisticsService = new StatisticsService(databaseService);
+                        statisticsService.Register();
+                    }
+                }
+                catch (Exception exception)
+                {
+                    Log.Error($"[Database] MariaDB initialization failed. Statistics, warnings and account links are unavailable; other plugin features will continue:\n{exception}");
+                    statisticsService?.Dispose();
+                    statisticsService = null;
+                    warningService?.Dispose();
+                    warningService = null;
+                    accountLinkService?.Dispose();
+                    accountLinkService = null;
+                    databaseService?.Dispose();
+                    databaseService = null;
+                }
+            }
+            else if (Config.Statistics?.IsEnabled == true || Config.Warnings?.IsEnabled == true || Config.Discord?.AccountLinking?.IsEnabled == true)
+            {
+                Log.Warn("[Database] MariaDB is disabled. Statistics, warnings and account links will not be started.");
+            }
 
             emptyRoundHandler = new Handlers.EmptyRoundHandler();
             Exiled.Events.Handlers.Player.Left += emptyRoundHandler.OnLeft;
@@ -89,6 +127,9 @@ namespace SmokyPluginV2
                 pinkCandyHandler = new Handlers.PinkCandyHandler();
                 pinkCandyHandler.Register();
             }
+
+            generalBroadcastHandler = new Handlers.GeneralBroadcastHandler();
+            generalBroadcastHandler.Register();
 
             if (Config.RolePreferences?.IsEnabled == true)
             {
@@ -151,6 +192,9 @@ namespace SmokyPluginV2
         /// <inheritdoc />
         public override void OnDisabled()
         {
+            statisticsService?.Dispose();
+            statisticsService = null;
+
             warningService?.Dispose();
             warningService = null;
 
@@ -172,6 +216,9 @@ namespace SmokyPluginV2
             accountLinkService?.Dispose();
             accountLinkService = null;
 
+            databaseService?.Dispose();
+            databaseService = null;
+
             if (emptyRoundHandler is not null)
             {
                 Exiled.Events.Handlers.Player.Left -= emptyRoundHandler.OnLeft;
@@ -186,6 +233,9 @@ namespace SmokyPluginV2
 
             pinkCandyHandler?.Unregister();
             pinkCandyHandler = null;
+
+            generalBroadcastHandler?.Unregister();
+            generalBroadcastHandler = null;
 
             rolePreferenceService?.Unregister();
             rolePreferenceService = null;
