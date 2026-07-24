@@ -2,7 +2,7 @@
 
 EXILED 9.14.2 plugin for SCP: Secret Laboratory 14.2.7.
 
-Version 0.18.1 stores player statistics, server statistics, account links and warnings in MariaDB. Multiple SCP:SL instances share one database configuration and are separated automatically by their game ports.
+Version 0.18.7 stores player statistics, server statistics, account links and warnings in MariaDB. Multiple SCP:SL instances share one database configuration and are separated automatically by their game ports.
 
 ## Current features
 
@@ -219,6 +219,24 @@ During the tower lobby, a command sender with the EXILED permission `smokyplugin
 At round start a narrowly scoped Harmony postfix allows only registered tower participants who are still Tutorial to pass `RoleAssigner.CheckPlayer`, and only while `RoleAssigner.OnRoundStarted` is executing. The existing atomic SCP and human spawner hooks then replace Tutorial directly with the final role. No intermediate Spectator role is assigned, which avoids a second post-start role swap and duplicate starting inventories.
 
 `priority_tiers` matches the player's current Remote Admin group case-insensitively. `weight` is relative: with one contested slot, weight `2` is twice as likely as one ordinary weight-`1` player, not a guaranteed win. When several slots exist, winners are drawn one at a time without replacement and weights are recalculated after every winner. The configured weight applies in every contested allocation.
+
+During the pre-round lobby, a moderator with the EXILED permission `smokyplugin.roleweight` may temporarily replace one online player's effective weight:
+
+```text
+roleweight <internal player ID> <weight>
+```
+
+Aliases: `setweight`, `rw`. The standard dotted Remote Admin selector form (for example, `12.`) is accepted. The weight must be a finite number greater than zero. The override immediately updates the tower hint and is used by the same weighted draw as group priorities. It is removed when the player leaves, the lobby is restarted, the next lobby begins, or the plugin is unloaded; it never changes `priority_tiers` or the player's Remote Admin group.
+
+When `reload configs` recreates the tower during an active lobby, the original native Tutorial spawn is carried over to the new tower instance. Dynamic zone measurement therefore remains anchored to the real spawn instead of using the current position of an already-staged Tutorial player.
+
+Add the separate permission node to the desired group in Exiled.Permissions `permissions.yml`:
+
+```yaml
+moderator:
+  permissions:
+    - smokyplugin.roleweight
+```
 
 The tower chooses the general SCP category. During vanilla role generation, the plugin keeps the generated role counts and exact SCP lineup but selects their players before the first role assignment.
 

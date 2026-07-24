@@ -124,6 +124,7 @@
     <Compile Include="Commands\AccountLinkCommands.cs" />
     <Compile Include="Commands\EventLobbyCommand.cs" />
     <Compile Include="Commands\MyWarningsCommand.cs" />
+    <Compile Include="Commands\RolePriorityCommand.cs" />
     <Compile Include="Commands\StatisticsRecordingCommand.cs" />
     <Compile Include="Commands\StatisticsClearCommand.cs" />
     <Compile Include="Commands\WarningCommands.cs" />

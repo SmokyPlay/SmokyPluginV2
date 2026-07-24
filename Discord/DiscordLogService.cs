@@ -385,6 +385,9 @@ namespace SmokyPluginV2.Discord
             {
                 if (database == null || Plugin.Instance?.Config?.Statistics?.IsEnabled != true)
                     return Ephemeral("Статистика сервера сейчас недоступна.");
+                if (Plugin.Instance?.Statistics is StatisticsService serverStatistics &&
+                    !serverStatistics.TryFlushPendingWrites(out string synchronizationError))
+                    return Ephemeral("❌ " + synchronizationError);
                 if (!database.TryGetServerStatistics(out ServerStatisticsRecord serverStats, out string serverError))
                     return Ephemeral("❌ " + serverError);
                 return new DiscordInteractionResponse
@@ -419,6 +422,9 @@ namespace SmokyPluginV2.Discord
             {
                 if (database == null || Plugin.Instance?.Config?.Statistics?.IsEnabled != true)
                     return Ephemeral("Статистика игроков сейчас недоступна.");
+                StatisticsService playerStatistics = Plugin.Instance?.Statistics;
+                if (playerStatistics != null && !playerStatistics.TryFlushPendingWrites(out string synchronizationError))
+                    return Ephemeral("❌ " + synchronizationError);
                 bool hasDiscord = interaction.TargetDiscordUserId != 0;
                 bool hasSteam = !string.IsNullOrWhiteSpace(interaction.SteamId);
                 if (hasDiscord && hasSteam)
@@ -448,6 +454,7 @@ namespace SmokyPluginV2.Discord
                     return Ephemeral("❌ " + statsError);
                 if (playerStats == null)
                     return Ephemeral("Для этого аккаунта статистика ещё не записана.");
+                playerStatistics?.ApplyLivePlayerStatistics(statsUserId, playerStats);
 
                 if (!database.TryGetPlayerUserId(interaction.UserId, out string requesterUserId, out string requesterError))
                     return Ephemeral("❌ " + requesterError);

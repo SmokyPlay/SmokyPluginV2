@@ -75,7 +75,7 @@ namespace SmokyPluginV2.Discord
                 Timeout = Timeout.InfiniteTimeSpan,
             };
             httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bot", settings.Token);
-            httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("DiscordBot (https://github.com/SmokyPlay/SmokyPluginV2, 0.18.1)");
+            httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("DiscordBot (https://github.com/SmokyPlay/SmokyPluginV2, 0.18.7)");
         }
 
         public event Action<DiscordMessage> PrefixedMessageReceived;

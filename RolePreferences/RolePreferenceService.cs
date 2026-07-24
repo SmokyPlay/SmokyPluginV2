@@ -23,6 +23,7 @@ namespace SmokyPluginV2.RolePreferences
         private const string AllowScpOverflowConfigKey = "allow_scp_overflow";
 
         private readonly Dictionary<ReferenceHub, RolePreferenceSelection> towerSelections = new Dictionary<ReferenceHub, RolePreferenceSelection>(ReferenceHubReferenceComparer.Instance);
+        private readonly Dictionary<ReferenceHub, double> lobbyWeightOverrides = new Dictionary<ReferenceHub, double>(ReferenceHubReferenceComparer.Instance);
         private readonly HashSet<ReferenceHub> reservedHumanPreferenceWinners = new HashSet<ReferenceHub>(ReferenceHubReferenceComparer.Instance);
         private readonly Random random = new Random();
         private readonly RolePreferenceSettings settings;
@@ -71,6 +72,7 @@ namespace SmokyPluginV2.RolePreferences
 
             tower?.StopLobby();
             towerSelections.Clear();
+            lobbyWeightOverrides.Clear();
             reservedHumanPreferenceWinners.Clear();
             roleAssignmentInProgress = false;
             isRegistered = false;
@@ -83,14 +85,24 @@ namespace SmokyPluginV2.RolePreferences
                 tower?.StopLobby();
         }
 
-        internal void ResumeLobbyAfterConfigReload()
+        internal void ResumeLobbyAfterConfigReload(UnityEngine.Vector3? preservedNativeTutorialSpawn)
         {
             towerSelections.Clear();
+            lobbyWeightOverrides.Clear();
             reservedHumanPreferenceWinners.Clear();
             roleAssignmentInProgress = false;
 
             if (isRegistered && runtimePatchesAvailable && tower is not null && Round.IsLobby)
-                tower.StartLobby();
+                tower.StartLobby(preservedNativeTutorialSpawn);
+        }
+
+        internal bool TryGetLobbyAnchor(out UnityEngine.Vector3 position)
+        {
+            if (tower is not null && tower.TryGetNativeTutorialSpawn(out position))
+                return true;
+
+            position = UnityEngine.Vector3.zero;
+            return false;
         }
 
         internal void BeginRoleAssignment()
@@ -247,6 +259,7 @@ namespace SmokyPluginV2.RolePreferences
         private void OnWaitingForPlayers()
         {
             towerSelections.Clear();
+            lobbyWeightOverrides.Clear();
             reservedHumanPreferenceWinners.Clear();
 
             if (tower is null)
@@ -276,6 +289,7 @@ namespace SmokyPluginV2.RolePreferences
             if (ev.Player?.ReferenceHub is ReferenceHub hub)
             {
                 towerSelections.Remove(hub);
+                lobbyWeightOverrides.Remove(hub);
                 tower?.Remove(hub);
             }
         }
@@ -296,6 +310,7 @@ namespace SmokyPluginV2.RolePreferences
         {
             tower?.StopLobby();
             towerSelections.Clear();
+            lobbyWeightOverrides.Clear();
             roleAssignmentInProgress = false;
         }
 
@@ -326,6 +341,36 @@ namespace SmokyPluginV2.RolePreferences
         internal RolePreferenceCategory GetTowerSelection(ReferenceHub hub) => GetCategory(hub);
 
         internal double GetTowerWeight(ReferenceHub hub) => GetEffectiveWeight(hub);
+
+        internal bool TrySetLobbyWeight(Player player, double weight, out double previousWeight, out string error)
+        {
+            previousWeight = 0;
+
+            if (!Round.IsLobby)
+            {
+                error = "Временный приоритет можно установить только до начала раунда.";
+                return false;
+            }
+
+            ReferenceHub hub = player?.ReferenceHub;
+            if (hub is null || !player.IsConnected || player.IsHost)
+            {
+                error = "Игрок не найден или уже отключился.";
+                return false;
+            }
+
+            if (weight <= 0 || double.IsNaN(weight) || double.IsInfinity(weight))
+            {
+                error = "Приоритет должен быть конечным числом больше нуля.";
+                return false;
+            }
+
+            previousWeight = GetEffectiveWeight(player);
+            lobbyWeightOverrides[hub] = weight;
+            tower?.MarkProbabilityDirty();
+            error = null;
+            return true;
+        }
 
         internal bool TryToggleEventBriefing(out bool enabled, out string error)
         {
@@ -746,6 +791,9 @@ namespace SmokyPluginV2.RolePreferences
         {
             if (player is null)
                 return GetDefaultWeight();
+
+            if (player.ReferenceHub is ReferenceHub hub && lobbyWeightOverrides.TryGetValue(hub, out double lobbyWeight))
+                return lobbyWeight;
 
             return GetConfiguredWeight(player);
         }

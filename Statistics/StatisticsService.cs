@@ -16,6 +16,8 @@ namespace SmokyPluginV2.Statistics
     using Exiled.Events.EventArgs.Server;
     using Exiled.Events.EventArgs.Warhead;
 
+    using LabApi.Events.Arguments.PlayerEvents;
+
     using MEC;
 
     using PlayerRoles;
@@ -30,11 +32,13 @@ namespace SmokyPluginV2.Statistics
     using Scp079Handlers = Exiled.Events.Handlers.Scp079;
     using Scp330Handlers = Exiled.Events.Handlers.Scp330;
     using WarheadHandlers = Exiled.Events.Handlers.Warhead;
+    using LabPlayerHandlers = LabApi.Events.Handlers.PlayerEvents;
 
     internal sealed class StatisticsService : IDisposable
     {
         private readonly MariaDbService database;
         private readonly BlockingCollection<Action> writeQueue = new BlockingCollection<Action>(5000);
+        private readonly ConcurrentDictionary<string, DateTime> activePocketStarts = new ConcurrentDictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         private readonly Thread writerThread;
         private readonly Dictionary<string, RoundPlayerState> players = new Dictionary<string, RoundPlayerState>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, PendingEscape> pendingEscapes = new Dictionary<string, PendingEscape>(StringComparer.OrdinalIgnoreCase);
@@ -79,8 +83,8 @@ namespace SmokyPluginV2.Statistics
             PlayerHandlers.ChangingRole += OnChangingRole;
             PlayerHandlers.Escaping += OnEscaping;
             PlayerHandlers.Escaped += OnEscaped;
-            PlayerHandlers.EnteringPocketDimension += OnEnteringPocketDimension;
-            PlayerHandlers.EscapingPocketDimension += OnEscapingPocketDimension;
+            LabPlayerHandlers.EnteredPocketDimension += OnEnteredPocketDimension;
+            LabPlayerHandlers.LeftPocketDimension += OnLeftPocketDimension;
             PlayerHandlers.ActivatingGenerator += OnActivatingGenerator;
             MapHandlers.GeneratorActivating += OnGeneratorActivated;
             Scp049Handlers.FinishingRecall += OnFinishingRecall;
@@ -90,6 +94,7 @@ namespace SmokyPluginV2.Statistics
             WarheadHandlers.Starting += OnWarheadStarting;
             WarheadHandlers.Stopping += OnWarheadStopping;
             WarheadHandlers.Detonated += OnWarheadDetonated;
+
         }
 
         public void Dispose()
@@ -106,8 +111,8 @@ namespace SmokyPluginV2.Statistics
             PlayerHandlers.ChangingRole -= OnChangingRole;
             PlayerHandlers.Escaping -= OnEscaping;
             PlayerHandlers.Escaped -= OnEscaped;
-            PlayerHandlers.EnteringPocketDimension -= OnEnteringPocketDimension;
-            PlayerHandlers.EscapingPocketDimension -= OnEscapingPocketDimension;
+            LabPlayerHandlers.EnteredPocketDimension -= OnEnteredPocketDimension;
+            LabPlayerHandlers.LeftPocketDimension -= OnLeftPocketDimension;
             PlayerHandlers.ActivatingGenerator -= OnActivatingGenerator;
             MapHandlers.GeneratorActivating -= OnGeneratorActivated;
             Scp049Handlers.FinishingRecall -= OnFinishingRecall;
@@ -203,6 +208,42 @@ namespace SmokyPluginV2.Statistics
             return true;
         }
 
+        public bool TryFlushPendingWrites(out string error)
+        {
+            error = null;
+            ManualResetEventSlim completed = new ManualResetEventSlim(false);
+            if (writeQueue.IsAddingCompleted || !writeQueue.TryAdd(completed.Set))
+            {
+                completed.Dispose();
+                error = "Очередь записи статистики недоступна.";
+                return false;
+            }
+
+            if (!completed.Wait(TimeSpan.FromSeconds(15)))
+            {
+                error = "MariaDB не успела синхронизировать статистику за 15 секунд. Повторите запрос.";
+                return false;
+            }
+
+            completed.Dispose();
+            return true;
+        }
+
+        public void ApplyLivePlayerStatistics(string userId, PlayerStatisticsRecord statistics)
+        {
+            if (!IsRecording || statistics == null)
+                return;
+
+            string normalizedUserId = MariaDbService.NormalizeSteamId(userId);
+            if (string.IsNullOrWhiteSpace(normalizedUserId) ||
+                !activePocketStarts.TryGetValue(normalizedUserId, out DateTime startedUtc))
+                return;
+
+            statistics.LongestPocketSeconds = Math.Max(
+                statistics.LongestPocketSeconds,
+                ElapsedSeconds(startedUtc, DateTime.UtcNow));
+        }
+
         public void OnWaveSpawned(SpawnableWaveBase wave)
         {
             if (!IsRecording || wave == null)
@@ -227,6 +268,7 @@ namespace SmokyPluginV2.Statistics
         {
             players.Clear();
             pendingEscapes.Clear();
+            activePocketStarts.Clear();
             generatorActivators.Clear();
             recordingPaused = false;
             systemRebootCounted = false;
@@ -250,6 +292,7 @@ namespace SmokyPluginV2.Statistics
             {
                 players.Clear();
                 pendingEscapes.Clear();
+                activePocketStarts.Clear();
                 return;
             }
 
@@ -281,6 +324,7 @@ namespace SmokyPluginV2.Statistics
             SafeServerUpdate(server);
             players.Clear();
             pendingEscapes.Clear();
+            activePocketStarts.Clear();
         }
 
         private void OnVerified(VerifiedEventArgs ev)
@@ -302,6 +346,7 @@ namespace SmokyPluginV2.Statistics
                 FlushStateIntervals(state, now, true);
                 players.Remove(ev.Player.UserId);
             }
+            activePocketStarts.TryRemove(MariaDbService.NormalizeSteamId(ev.Player.UserId), out _);
             SafePlayerUpdate(ev.Player.UserId, ev.Player.Nickname, new PlayerStatDelta(), now);
         }
 
@@ -314,6 +359,8 @@ namespace SmokyPluginV2.Statistics
             RoleCategory newCategory = Classify(ev.NewRole);
             bool categoryChanged = state.Category != newCategory;
             FlushRoleInterval(state, now);
+            if (categoryChanged)
+                PersistPocketStay(ev.Player, state, now);
             if (categoryChanged)
                 FinalizeLife(state, now);
             state.Category = newCategory;
@@ -331,7 +378,7 @@ namespace SmokyPluginV2.Statistics
             victimState.Category = Classify(ev.TargetOldRole);
             FlushRoleInterval(victimState, now);
             FinalizeLife(victimState, now);
-            FinishPocket(victimState, now);
+            PersistPocketStay(ev.Player, victimState, now);
             victimState.Category = RoleCategory.Spectator;
             victimState.RoleIntervalStartedUtc = now;
 
@@ -419,28 +466,46 @@ namespace SmokyPluginV2.Statistics
                 SafePlayerUpdate(ev.Player.UserId, ev.Player.Nickname, delta, now);
         }
 
-        private void OnEnteringPocketDimension(EnteringPocketDimensionEventArgs ev)
+        private void OnEnteredPocketDimension(PlayerEnteredPocketDimensionEventArgs ev)
         {
-            if (!IsRecording || !ev.IsAllowed || !IsRealPlayer(ev.Player))
+            Player player = Player.Get(ev.Player);
+            if (!IsRecording || !IsRealPlayer(player))
                 return;
-            RoundPlayerState state = GetState(ev.Player);
-            if (!state.InPocket)
-            {
-                state.InPocket = true;
-                state.PocketIntervalStartedUtc = DateTime.UtcNow;
-            }
-            SafePlayerUpdate(ev.Player.UserId, ev.Player.Nickname, new PlayerStatDelta().Increment("pocket_entries"), DateTime.UtcNow);
+
+            BeginPocketStay(player, DateTime.UtcNow);
         }
 
-        private void OnEscapingPocketDimension(EscapingPocketDimensionEventArgs ev)
+        private void BeginPocketStay(Player player, DateTime now)
         {
-            if (!IsRecording || !ev.IsAllowed || !IsRealPlayer(ev.Player))
+            RoundPlayerState state = GetState(player);
+            if (state.InPocket)
                 return;
+
+            state.InPocket = true;
+            state.PocketSeconds = 0;
+            state.PocketIntervalStartedUtc = now;
+            activePocketStarts[MariaDbService.NormalizeSteamId(player.UserId)] = now;
+            SafePlayerUpdate(player.UserId, player.Nickname, new PlayerStatDelta().Increment("pocket_entries"), now);
+            Log.Debug($"[Statistics] Pocket entry registered for {player.UserId}.");
+        }
+
+        private void OnLeftPocketDimension(PlayerLeftPocketDimensionEventArgs ev)
+        {
+            Player player = Player.Get(ev.Player);
+            if (!IsRecording || !IsRealPlayer(player))
+                return;
+
             DateTime now = DateTime.UtcNow;
-            RoundPlayerState state = GetState(ev.Player);
+            RoundPlayerState state = GetState(player);
+            if (!state.InPocket)
+                return;
+
             long stay = FinishPocket(state, now);
-            SafePlayerUpdate(ev.Player.UserId, ev.Player.Nickname,
-                new PlayerStatDelta().Increment("pocket_escapes").Max("longest_pocket_seconds", stay), now);
+            PlayerStatDelta delta = new PlayerStatDelta().Max("longest_pocket_seconds", stay);
+            if (ev.IsSuccessful)
+                delta.Increment("pocket_escapes");
+            SafePlayerUpdate(player.UserId, player.Nickname, delta, now);
+            Log.Debug($"[Statistics] Pocket stay registered for {player.UserId}: {stay} second(s), escaped={ev.IsSuccessful}.");
         }
 
         private void OnActivatingGenerator(ActivatingGeneratorEventArgs ev)
@@ -611,8 +676,20 @@ namespace SmokyPluginV2.Statistics
             state.InPocket = false;
             state.PocketSeconds = 0;
             state.PocketIntervalStartedUtc = null;
+            activePocketStarts.TryRemove(MariaDbService.NormalizeSteamId(state.UserId), out _);
             return seconds;
         }
+
+        private void PersistPocketStay(Player player, RoundPlayerState state, DateTime now)
+        {
+            if (!state.InPocket)
+                return;
+
+            long stay = FinishPocket(state, now);
+            SafePlayerUpdate(state.UserId, player?.Nickname ?? state.Nickname,
+                new PlayerStatDelta().Max("longest_pocket_seconds", stay), now);
+        }
+
 
         private void ResumeState(RoundPlayerState state, Player player, DateTime now)
         {
@@ -621,7 +698,10 @@ namespace SmokyPluginV2.Statistics
             state.RoleIntervalStartedUtc = IsTracked(state.Category) ? now : (DateTime?)null;
             state.LifeIntervalStartedUtc = IsLiving(state.Category) ? now : (DateTime?)null;
             if (state.InPocket)
+            {
                 state.PocketIntervalStartedUtc = now;
+                activePocketStarts[MariaDbService.NormalizeSteamId(state.UserId)] = now;
+            }
         }
 
         private RoundPlayerState GetState(Player player)
@@ -644,6 +724,7 @@ namespace SmokyPluginV2.Statistics
             recordingPaused = false;
             players.Clear();
             pendingEscapes.Clear();
+            activePocketStarts.Clear();
             generatorActivators.Clear();
         }
 

@@ -13,6 +13,8 @@ namespace SmokyPluginV2
     using SmokyPluginV2.RolePreferences;
     using SmokyPluginV2.Statistics;
 
+    using UnityEngine;
+
     /// <summary>
     /// Main EXILED plugin entry point.
     /// </summary>
@@ -62,7 +64,7 @@ namespace SmokyPluginV2
         public override string Author => "Smoky";
 
         /// <inheritdoc />
-        public override Version Version => new(0, 18, 1);
+        public override Version Version => new(0, 18, 7);
 
         /// <inheritdoc />
         public override Version RequiredExiledVersion => new(9, 14, 2);
@@ -264,12 +266,16 @@ namespace SmokyPluginV2
             }
 
             RolePreferenceService previous = rolePreferenceService;
+            Vector3? preservedNativeTutorialSpawn = null;
+            if (previous?.TryGetLobbyAnchor(out Vector3 previousLobbyAnchor) == true)
+                preservedNativeTutorialSpawn = previousLobbyAnchor;
+
             previous?.Unregister();
             rolePreferenceService = replacement;
 
             try
             {
-                replacement?.ResumeLobbyAfterConfigReload();
+                replacement?.ResumeLobbyAfterConfigReload(preservedNativeTutorialSpawn);
                 Log.Info(replacement is null
                     ? "[Role Preferences] Runtime configuration reloaded; the role preference system is disabled."
                     : "[Role Preferences] Runtime configuration reloaded successfully.");

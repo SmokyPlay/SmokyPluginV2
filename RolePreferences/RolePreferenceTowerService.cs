@@ -13,6 +13,7 @@ namespace SmokyPluginV2.RolePreferences
     using MEC;
 
     using PlayerRoles;
+    using PlayerRoles.FirstPersonControl.Spawnpoints;
 
     using UnityEngine;
 
@@ -58,13 +59,18 @@ namespace SmokyPluginV2.RolePreferences
 
         public bool Contains(ReferenceHub hub) => hub is not null && participants.ContainsKey(hub);
 
-        public void StartLobby()
+        public void StartLobby(Vector3? preservedNativeTutorialSpawn = null)
         {
             StopLobby();
             lobbyActive = true;
             probabilityDirty = true;
             nextHintAt = 0;
             HideStartRoundScreen();
+
+            if (preservedNativeTutorialSpawn.HasValue)
+                CreateMarkers(preservedNativeTutorialSpawn.Value);
+            else if (TryResolveNativeTutorialSpawn(out Vector3 nativeTutorialSpawn))
+                CreateMarkers(nativeTutorialSpawn);
 
             foreach (Player player in Player.List)
                 Stage(player);
@@ -176,6 +182,24 @@ namespace SmokyPluginV2.RolePreferences
         }
 
         public void MarkProbabilityDirty() => probabilityDirty = true;
+
+        public bool TryGetNativeTutorialSpawn(out Vector3 position)
+        {
+            position = randomSelectionCenter;
+            return randomSelectionCenterSet;
+        }
+
+        private static bool TryResolveNativeTutorialSpawn(out Vector3 position)
+        {
+            position = Vector3.zero;
+            if (!RoleSpawnpointManager.TryGetSpawnpointForRole(RoleTypeId.Tutorial, out ISpawnpointHandler handler) ||
+                handler is null)
+            {
+                return false;
+            }
+
+            return handler.TryGetSpawnpoint(out position, out _);
+        }
 
         public bool TryToggleEventBriefing(out bool enabled, out string error)
         {
