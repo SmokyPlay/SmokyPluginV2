@@ -5,12 +5,15 @@ namespace SmokyPluginV2.Database
     using System.Data;
     using System.Globalization;
     using System.Linq;
+    using System.Security.Cryptography;
+    using System.Text;
 
     using Exiled.API.Features;
 
     using MySql.Data.MySqlClient;
 
     using SmokyPluginV2.AccountLinks;
+    using SmokyPluginV2.Referrals;
     using SmokyPluginV2.Statistics;
     using SmokyPluginV2.Warnings;
 
@@ -101,6 +104,462 @@ namespace SmokyPluginV2.Database
             catch (Exception exception)
             {
                 return Fail("account-link lookup", exception, out error);
+            }
+        }
+
+        public bool TryResolveAccessIdentityBySteamId(
+            string playerUserId,
+            out long playerId,
+            out string resolvedPlayerUserId,
+            out ulong discordUserId,
+            out string error)
+        {
+            playerId = 0;
+            resolvedPlayerUserId = null;
+            discordUserId = 0;
+            try
+            {
+                using (MySqlConnection connection = OpenConnection())
+                using (MySqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
+                {
+                    playerId = GetOrCreatePlayerId(connection, transaction, playerUserId, null);
+                    resolvedPlayerUserId = ToExiledUserId(NormalizeSteamId(playerUserId));
+                    using (MySqlCommand link = CreateCommand(connection,
+                        "SELECT discord_user_id FROM account_links WHERE player_id=@player_id LIMIT 1", transaction))
+                    {
+                        link.Parameters.AddWithValue("@player_id", playerId);
+                        object value = link.ExecuteScalar();
+                        if (value != null && value != DBNull.Value)
+                            discordUserId = ulong.Parse(Convert.ToString(value, CultureInfo.InvariantCulture), CultureInfo.InvariantCulture);
+                    }
+
+                    transaction.Commit();
+                }
+
+                error = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                return Fail("Steam access identity lookup", exception, out error);
+            }
+        }
+
+        public bool TryResolveAccessIdentityByDiscordId(
+            ulong discordUserId,
+            out long playerId,
+            out string playerUserId,
+            out string error)
+        {
+            playerId = 0;
+            playerUserId = null;
+            try
+            {
+                using (MySqlConnection connection = OpenConnection())
+                using (MySqlCommand command = CreateCommand(connection,
+                    "SELECT p.id,p.steam_id FROM account_links al " +
+                    "JOIN players p ON p.id=al.player_id WHERE al.discord_user_id=@discord_id LIMIT 1"))
+                {
+                    command.Parameters.AddWithValue("@discord_id", discordUserId.ToString(CultureInfo.InvariantCulture));
+                    using (MySqlDataReader reader = command.ExecuteReader())
+                    {
+                        if (reader.Read())
+                        {
+                            playerId = reader.GetInt64("id");
+                            playerUserId = ToExiledUserId(reader.GetString("steam_id"));
+                        }
+                    }
+                }
+
+                error = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                return Fail("Discord access identity lookup", exception, out error);
+            }
+        }
+
+        public bool TryGetTotalPlaytimeSeconds(long playerId, out long totalPlaytimeSeconds, out string error)
+        {
+            totalPlaytimeSeconds = 0;
+            try
+            {
+                using (MySqlConnection connection = OpenConnection())
+                using (MySqlCommand command = CreateCommand(connection,
+                    "SELECT COALESCE(human_seconds,0)+COALESCE(scp_seconds,0)+COALESCE(spectator_seconds,0) " +
+                    "FROM player_statistics WHERE server_id=@server_id AND player_id=@player_id LIMIT 1"))
+                {
+                    command.Parameters.AddWithValue("@server_id", ServerId);
+                    command.Parameters.AddWithValue("@player_id", playerId);
+                    object value = command.ExecuteScalar();
+                    totalPlaytimeSeconds = value == null || value == DBNull.Value
+                        ? 0
+                        : Convert.ToInt64(value, CultureInfo.InvariantCulture);
+                }
+
+                error = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                return Fail("player playtime lookup", exception, out error);
+            }
+        }
+
+        public bool TryGetReferralAccessState(
+            long playerId,
+            long qualificationSeconds,
+            out ReferralAccessState state,
+            out string error)
+        {
+            state = new ReferralAccessState();
+            try
+            {
+                using (MySqlConnection connection = OpenConnection())
+                using (MySqlCommand command = CreateCommand(connection,
+                    "SELECT " +
+                    "(SELECT COUNT(*) FROM referrals r WHERE r.inviter_player_id=@player_id AND " +
+                    "(SELECT COALESCE(SUM(COALESCE(ps.human_seconds,0)+COALESCE(ps.scp_seconds,0)+COALESCE(ps.spectator_seconds,0)),0) " +
+                    "FROM player_statistics ps WHERE ps.player_id=r.invited_player_id)>=@required_seconds) AS qualified_count," +
+                    "EXISTS(SELECT 1 FROM referrals r WHERE r.invited_player_id=@player_id AND " +
+                    "(SELECT COALESCE(SUM(COALESCE(ps.human_seconds,0)+COALESCE(ps.scp_seconds,0)+COALESCE(ps.spectator_seconds,0)),0) " +
+                    "FROM player_statistics ps WHERE ps.player_id=r.invited_player_id)<@required_seconds) AS is_pending"))
+                {
+                    command.Parameters.AddWithValue("@player_id", playerId);
+                    command.Parameters.AddWithValue("@required_seconds", Math.Max(1, qualificationSeconds));
+                    using (MySqlDataReader reader = command.ExecuteReader())
+                    {
+                        if (reader.Read())
+                        {
+                            state.QualifiedReferralCount = Convert.ToInt32(
+                                reader["qualified_count"],
+                                CultureInfo.InvariantCulture);
+                            state.IsPendingInvitee = Convert.ToBoolean(
+                                reader["is_pending"],
+                                CultureInfo.InvariantCulture);
+                        }
+                    }
+                }
+
+                error = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                state = null;
+                return Fail("referral access lookup", exception, out error);
+            }
+        }
+
+        public bool TryIsPendingReferral(
+            string playerUserId,
+            long qualificationSeconds,
+            out bool isPending,
+            out string error)
+        {
+            isPending = false;
+            try
+            {
+                using (MySqlConnection connection = OpenConnection())
+                using (MySqlCommand command = CreateCommand(connection,
+                    "SELECT EXISTS(SELECT 1 FROM referrals r " +
+                    "JOIN players p ON p.id=r.invited_player_id " +
+                    "WHERE p.steam_id=@steam_id AND " +
+                    "(SELECT COALESCE(SUM(COALESCE(ps.human_seconds,0)+COALESCE(ps.scp_seconds,0)+COALESCE(ps.spectator_seconds,0)),0) " +
+                    "FROM player_statistics ps WHERE ps.player_id=r.invited_player_id)<@required_seconds)"))
+                {
+                    command.Parameters.AddWithValue("@steam_id", NormalizeSteamId(playerUserId));
+                    command.Parameters.AddWithValue("@required_seconds", Math.Max(1, qualificationSeconds));
+                    isPending = Convert.ToBoolean(command.ExecuteScalar(), CultureInfo.InvariantCulture);
+                }
+
+                error = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                return Fail("pending referral lookup", exception, out error);
+            }
+        }
+
+        public bool TryAcceptReferral(
+            string invitedPlayerUserId,
+            string referralCode,
+            long unpersistedPlaytimeSeconds,
+            long entryMaximumSeconds,
+            DateTime acceptedAtUtc,
+            out string response)
+        {
+            string normalizedCode = NormalizeReferralCode(referralCode);
+            if (string.IsNullOrWhiteSpace(normalizedCode))
+            {
+                response = "Укажите реферальный код: .ref КОД";
+                return false;
+            }
+
+            try
+            {
+                using (MySqlConnection connection = OpenConnection())
+                using (MySqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
+                {
+                    long invitedPlayerId = GetOrCreatePlayerId(
+                        connection,
+                        transaction,
+                        invitedPlayerUserId,
+                        null);
+                    using (MySqlCommand lockInvited = CreateCommand(connection,
+                        "SELECT id FROM players WHERE id=@player_id FOR UPDATE",
+                        transaction))
+                    {
+                        lockInvited.Parameters.AddWithValue("@player_id", invitedPlayerId);
+                        lockInvited.ExecuteScalar();
+                    }
+
+                    using (MySqlCommand existing = CreateCommand(connection,
+                        "SELECT 1 FROM referrals WHERE invited_player_id=@player_id LIMIT 1",
+                        transaction))
+                    {
+                        existing.Parameters.AddWithValue("@player_id", invitedPlayerId);
+                        if (existing.ExecuteScalar() != null)
+                        {
+                            response = "Вы уже использовали реферальный код.";
+                            return false;
+                        }
+                    }
+
+                    long persistedSeconds = GetTotalNetworkPlaytimeSeconds(
+                        connection,
+                        transaction,
+                        invitedPlayerId);
+                    long observedSeconds = SaturatingAdd(
+                        persistedSeconds,
+                        Math.Max(0, unpersistedPlaytimeSeconds));
+                    if (observedSeconds >= Math.Max(0, entryMaximumSeconds))
+                    {
+                        response = "Реферальный код можно ввести только в первые минуты игры на сервере.";
+                        return false;
+                    }
+
+                    long inviterPlayerId;
+                    using (MySqlCommand inviter = CreateCommand(connection,
+                        "SELECT id FROM players WHERE referral_code=@code LIMIT 1 FOR UPDATE",
+                        transaction))
+                    {
+                        inviter.Parameters.AddWithValue("@code", normalizedCode);
+                        object inviterValue = inviter.ExecuteScalar();
+                        if (inviterValue == null || inviterValue == DBNull.Value)
+                        {
+                            response = "Такой реферальный код не найден.";
+                            return false;
+                        }
+
+                        inviterPlayerId = Convert.ToInt64(inviterValue, CultureInfo.InvariantCulture);
+                    }
+
+                    if (inviterPlayerId == invitedPlayerId)
+                    {
+                        response = "Нельзя использовать собственный реферальный код.";
+                        return false;
+                    }
+
+                    using (MySqlCommand insert = CreateCommand(connection,
+                        "INSERT INTO referrals(invited_player_id,inviter_player_id,accepted_at) " +
+                        "VALUES(@invited_player_id,@inviter_player_id,@accepted_at)",
+                        transaction))
+                    {
+                        insert.Parameters.AddWithValue("@invited_player_id", invitedPlayerId);
+                        insert.Parameters.AddWithValue("@inviter_player_id", inviterPlayerId);
+                        insert.Parameters.AddWithValue("@accepted_at", acceptedAtUtc);
+                        insert.ExecuteNonQuery();
+                    }
+
+                    transaction.Commit();
+                }
+
+                response = "Реферальный код принят. Бонус действует до подтверждения приглашения.";
+                return true;
+            }
+            catch (Exception exception)
+            {
+                Fail("referral acceptance", exception, out response);
+                return false;
+            }
+        }
+
+        public bool TryGetOrCreateReferralStatus(
+            ulong discordUserId,
+            out ReferralStatus status,
+            out string error)
+        {
+            status = null;
+            try
+            {
+                using (MySqlConnection connection = OpenConnection())
+                using (MySqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
+                {
+                    long playerId;
+                    string playerUserId;
+                    string referralCode;
+                    using (MySqlCommand player = CreateCommand(connection,
+                        "SELECT p.id,p.steam_id,p.referral_code FROM account_links al " +
+                        "JOIN players p ON p.id=al.player_id WHERE al.discord_user_id=@discord_id LIMIT 1 FOR UPDATE",
+                        transaction))
+                    {
+                        player.Parameters.AddWithValue(
+                            "@discord_id",
+                            discordUserId.ToString(CultureInfo.InvariantCulture));
+                        using (MySqlDataReader reader = player.ExecuteReader())
+                        {
+                            if (!reader.Read())
+                            {
+                                error = "Сначала привяжите игровой аккаунт командой /link.";
+                                return false;
+                            }
+
+                            playerId = reader.GetInt64("id");
+                            playerUserId = ToExiledUserId(reader.GetString("steam_id"));
+                            referralCode = reader.IsDBNull(reader.GetOrdinal("referral_code"))
+                                ? null
+                                : reader.GetString("referral_code");
+                        }
+                    }
+
+                    if (string.IsNullOrWhiteSpace(referralCode))
+                        referralCode = CreateReferralCode(connection, transaction, playerId);
+
+                    List<ReferralParticipant> participants = new List<ReferralParticipant>();
+                    using (MySqlCommand referrals = CreateCommand(connection,
+                        "SELECT p.steam_id,p.last_nickname,r.accepted_at," +
+                        "COALESCE(SUM(COALESCE(ps.human_seconds,0)+COALESCE(ps.scp_seconds,0)+COALESCE(ps.spectator_seconds,0)),0) AS total_seconds " +
+                        "FROM referrals r JOIN players p ON p.id=r.invited_player_id " +
+                        "LEFT JOIN player_statistics ps ON ps.player_id=p.id " +
+                        "WHERE r.inviter_player_id=@player_id " +
+                        "GROUP BY p.id,p.steam_id,p.last_nickname,r.accepted_at " +
+                        "ORDER BY r.accepted_at ASC",
+                        transaction))
+                    {
+                        referrals.Parameters.AddWithValue("@player_id", playerId);
+                        using (MySqlDataReader reader = referrals.ExecuteReader())
+                        {
+                            while (reader.Read())
+                            {
+                                participants.Add(new ReferralParticipant
+                                {
+                                    PlayerUserId = ToExiledUserId(reader.GetString("steam_id")),
+                                    Nickname = reader.IsDBNull(reader.GetOrdinal("last_nickname"))
+                                        ? null
+                                        : reader.GetString("last_nickname"),
+                                    AcceptedAtUtc = DateTime.SpecifyKind(
+                                        reader.GetDateTime("accepted_at"),
+                                        DateTimeKind.Utc),
+                                    TotalPlaytimeSeconds = Convert.ToInt64(
+                                        reader["total_seconds"],
+                                        CultureInfo.InvariantCulture),
+                                });
+                            }
+                        }
+                    }
+
+                    transaction.Commit();
+                    status = new ReferralStatus
+                    {
+                        PlayerUserId = playerUserId,
+                        ReferralCode = referralCode,
+                        Participants = participants,
+                    };
+                }
+
+                error = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                status = null;
+                return Fail("referral status lookup", exception, out error);
+            }
+        }
+
+        public bool TryGetReferralQualificationTransition(
+            string invitedPlayerUserId,
+            long addedPlaytimeSeconds,
+            long qualificationSeconds,
+            int requiredReferrals,
+            out ReferralQualificationTransition transition,
+            out string error)
+        {
+            transition = null;
+            try
+            {
+                using (MySqlConnection connection = OpenConnection())
+                {
+                    long invitedPlayerId;
+                    long inviterPlayerId;
+                    string inviterSteamId;
+                    using (MySqlCommand relation = CreateCommand(connection,
+                        "SELECT invited.id AS invited_id,inviter.id AS inviter_id,inviter.steam_id AS inviter_steam_id " +
+                        "FROM referrals r JOIN players invited ON invited.id=r.invited_player_id " +
+                        "JOIN players inviter ON inviter.id=r.inviter_player_id " +
+                        "WHERE invited.steam_id=@steam_id LIMIT 1"))
+                    {
+                        relation.Parameters.AddWithValue(
+                            "@steam_id",
+                            NormalizeSteamId(invitedPlayerUserId));
+                        using (MySqlDataReader reader = relation.ExecuteReader())
+                        {
+                            if (!reader.Read())
+                            {
+                                error = null;
+                                return true;
+                            }
+
+                            invitedPlayerId = reader.GetInt64("invited_id");
+                            inviterPlayerId = reader.GetInt64("inviter_id");
+                            inviterSteamId = ToExiledUserId(reader.GetString("inviter_steam_id"));
+                        }
+                    }
+
+                    long totalSeconds = GetTotalNetworkPlaytimeSeconds(
+                        connection,
+                        null,
+                        invitedPlayerId);
+                    long threshold = Math.Max(1, qualificationSeconds);
+                    bool crossed = totalSeconds >= threshold &&
+                        Math.Max(0, totalSeconds - Math.Max(0, addedPlaytimeSeconds)) < threshold;
+                    if (!crossed)
+                    {
+                        error = null;
+                        return true;
+                    }
+
+                    int qualifiedCount;
+                    using (MySqlCommand qualified = CreateCommand(connection,
+                        "SELECT COUNT(*) FROM referrals r WHERE r.inviter_player_id=@inviter_id AND " +
+                        "(SELECT COALESCE(SUM(COALESCE(ps.human_seconds,0)+COALESCE(ps.scp_seconds,0)+COALESCE(ps.spectator_seconds,0)),0) " +
+                        "FROM player_statistics ps WHERE ps.player_id=r.invited_player_id)>=@required_seconds"))
+                    {
+                        qualified.Parameters.AddWithValue("@inviter_id", inviterPlayerId);
+                        qualified.Parameters.AddWithValue("@required_seconds", threshold);
+                        qualifiedCount = Convert.ToInt32(
+                            qualified.ExecuteScalar(),
+                            CultureInfo.InvariantCulture);
+                    }
+
+                    transition = new ReferralQualificationTransition
+                    {
+                        InviteeQualified = true,
+                        InviterPlayerUserId = inviterSteamId,
+                        RewardThresholdReached = qualifiedCount == Math.Max(1, requiredReferrals),
+                    };
+                }
+
+                error = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                transition = null;
+                return Fail("referral qualification check", exception, out error);
             }
         }
 
@@ -633,6 +1092,17 @@ namespace SmokyPluginV2.Database
             return normalized;
         }
 
+        public static bool IsSteamUserId(string userId)
+        {
+            string normalized = (userId ?? string.Empty).Trim();
+            int separator = normalized.IndexOf('@');
+            if (separator >= 0)
+                normalized = normalized.Substring(0, separator);
+
+            return normalized.Length == 17 &&
+                normalized.All(character => character >= '0' && character <= '9');
+        }
+
         public static string ToExiledUserId(string steamId) => NormalizeSteamId(steamId) + "@steam";
 
         private const string WarningSelect =
@@ -659,11 +1129,26 @@ namespace SmokyPluginV2.Database
                     using (MySqlCommand privacyMigration = CreateCommand(connection,
                         "ALTER TABLE players ADD COLUMN IF NOT EXISTS statistics_private BOOLEAN NOT NULL DEFAULT FALSE AFTER last_nickname"))
                         privacyMigration.ExecuteNonQuery();
+                    using (MySqlCommand referralCodeMigration = CreateCommand(connection,
+                        "ALTER TABLE players ADD COLUMN IF NOT EXISTS referral_code VARCHAR(16) NULL AFTER statistics_private"))
+                        referralCodeMigration.ExecuteNonQuery();
+                    using (MySqlCommand referralCodeIndex = CreateCommand(connection,
+                        "CREATE UNIQUE INDEX IF NOT EXISTS ux_players_referral_code ON players(referral_code)"))
+                        referralCodeIndex.ExecuteNonQuery();
+                    using (MySqlCommand removePersistedPrivileges = CreateCommand(connection,
+                        "DROP TABLE IF EXISTS player_privileges"))
+                        removePersistedPrivileges.ExecuteNonQuery();
                     using (MySqlCommand version = CreateCommand(connection,
                         "INSERT IGNORE INTO schema_migrations(version,description) VALUES(1,'Initial MariaDB schema')"))
                         version.ExecuteNonQuery();
                     using (MySqlCommand version = CreateCommand(connection,
                         "INSERT IGNORE INTO schema_migrations(version,description) VALUES(2,'Player statistics privacy')"))
+                        version.ExecuteNonQuery();
+                    using (MySqlCommand version = CreateCommand(connection,
+                        "INSERT IGNORE INTO schema_migrations(version,description) VALUES(4,'Computed playtime privileges')"))
+                        version.ExecuteNonQuery();
+                    using (MySqlCommand version = CreateCommand(connection,
+                        "INSERT IGNORE INTO schema_migrations(version,description) VALUES(5,'Referral program')"))
                         version.ExecuteNonQuery();
                 }
                 finally
@@ -749,6 +1234,9 @@ namespace SmokyPluginV2.Database
 
         private long GetOrCreatePlayerId(MySqlConnection connection, MySqlTransaction transaction, string playerUserId, string nickname)
         {
+            if (!IsSteamUserId(playerUserId))
+                throw new ArgumentException("Only real Steam players can be persisted.", nameof(playerUserId));
+
             using (MySqlCommand command = CreateCommand(connection,
                 "INSERT INTO players(steam_id,last_nickname) VALUES(@steam_id,@nickname) " +
                 "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id),last_nickname=COALESCE(NULLIF(VALUES(last_nickname),''),last_nickname)", transaction))
@@ -765,6 +1253,85 @@ namespace SmokyPluginV2.Database
                 return Convert.ToInt64(lookup.ExecuteScalar(), CultureInfo.InvariantCulture);
             }
         }
+
+        private static long GetTotalNetworkPlaytimeSeconds(
+            MySqlConnection connection,
+            MySqlTransaction transaction,
+            long playerId)
+        {
+            using (MySqlCommand command = CreateCommand(connection,
+                "SELECT COALESCE(SUM(COALESCE(human_seconds,0)+COALESCE(scp_seconds,0)+COALESCE(spectator_seconds,0)),0) " +
+                "FROM player_statistics WHERE player_id=@player_id",
+                transaction))
+            {
+                command.Parameters.AddWithValue("@player_id", playerId);
+                return Convert.ToInt64(command.ExecuteScalar(), CultureInfo.InvariantCulture);
+            }
+        }
+
+        private static string CreateReferralCode(
+            MySqlConnection connection,
+            MySqlTransaction transaction,
+            long playerId)
+        {
+            for (int attempt = 0; attempt < 20; attempt++)
+            {
+                string code = GenerateReferralCode();
+                try
+                {
+                    using (MySqlCommand update = CreateCommand(connection,
+                        "UPDATE players SET referral_code=@code WHERE id=@player_id AND referral_code IS NULL",
+                        transaction))
+                    {
+                        update.Parameters.AddWithValue("@code", code);
+                        update.Parameters.AddWithValue("@player_id", playerId);
+                        if (update.ExecuteNonQuery() == 1)
+                            return code;
+                    }
+
+                    using (MySqlCommand existing = CreateCommand(connection,
+                        "SELECT referral_code FROM players WHERE id=@player_id",
+                        transaction))
+                    {
+                        existing.Parameters.AddWithValue("@player_id", playerId);
+                        object value = existing.ExecuteScalar();
+                        if (value != null && value != DBNull.Value)
+                            return Convert.ToString(value, CultureInfo.InvariantCulture);
+                    }
+                }
+                catch (MySqlException exception) when (exception.Number == 1062)
+                {
+                    // Extremely unlikely code collision; generate a new code in the same transaction.
+                }
+            }
+
+            throw new InvalidOperationException("Could not generate a unique referral code.");
+        }
+
+        private static string GenerateReferralCode()
+        {
+            const string alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+            byte[] bytes = new byte[8];
+            using (RandomNumberGenerator random = RandomNumberGenerator.Create())
+                random.GetBytes(bytes);
+            StringBuilder result = new StringBuilder(9);
+            for (int index = 0; index < bytes.Length; index++)
+            {
+                if (index == 4)
+                    result.Append('-');
+                result.Append(alphabet[bytes[index] % alphabet.Length]);
+            }
+
+            return result.ToString();
+        }
+
+        private static string NormalizeReferralCode(string code) =>
+            string.IsNullOrWhiteSpace(code)
+                ? string.Empty
+                : code.Trim().Replace(" ", string.Empty).ToUpperInvariant();
+
+        private static long SaturatingAdd(long left, long right) =>
+            left > long.MaxValue - right ? long.MaxValue : left + right;
 
         private void InsertWarning(MySqlConnection connection, MySqlTransaction transaction, WarningRecord warning, long playerId)
         {
@@ -865,8 +1432,9 @@ namespace SmokyPluginV2.Database
         {
             "CREATE TABLE IF NOT EXISTS schema_migrations(version INT UNSIGNED NOT NULL PRIMARY KEY,description VARCHAR(255) NOT NULL,applied_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
             "CREATE TABLE IF NOT EXISTS servers(id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,display_name VARCHAR(128) NOT NULL,game_port SMALLINT UNSIGNED NOT NULL UNIQUE,created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
-            "CREATE TABLE IF NOT EXISTS players(id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,steam_id VARCHAR(32) NOT NULL UNIQUE,last_nickname VARCHAR(64) NULL,statistics_private BOOLEAN NOT NULL DEFAULT FALSE,created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+            "CREATE TABLE IF NOT EXISTS players(id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,steam_id VARCHAR(32) NOT NULL UNIQUE,last_nickname VARCHAR(64) NULL,statistics_private BOOLEAN NOT NULL DEFAULT FALSE,referral_code VARCHAR(16) NULL,created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
             "CREATE TABLE IF NOT EXISTS account_links(player_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,discord_user_id VARCHAR(20) NOT NULL UNIQUE,linked_at DATETIME(6) NOT NULL,CONSTRAINT fk_account_links_player FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+            "CREATE TABLE IF NOT EXISTS referrals(invited_player_id BIGINT UNSIGNED NOT NULL,inviter_player_id BIGINT UNSIGNED NOT NULL,accepted_at DATETIME(6) NOT NULL,PRIMARY KEY(invited_player_id),KEY ix_referrals_inviter(inviter_player_id),CONSTRAINT fk_referrals_invited FOREIGN KEY(invited_player_id) REFERENCES players(id) ON DELETE CASCADE,CONSTRAINT fk_referrals_inviter FOREIGN KEY(inviter_player_id) REFERENCES players(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
             "CREATE TABLE IF NOT EXISTS warnings(server_id BIGINT UNSIGNED NOT NULL,id BIGINT UNSIGNED NOT NULL,player_id BIGINT UNSIGNED NOT NULL,player_nickname VARCHAR(64) NOT NULL,moderator_user_id VARCHAR(64) NOT NULL,moderator_nickname VARCHAR(64) NOT NULL,issued_at DATETIME(6) NOT NULL,reason TEXT NOT NULL,PRIMARY KEY(server_id,id),KEY ix_warnings_player(server_id,player_id),CONSTRAINT fk_warnings_server FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,CONSTRAINT fk_warnings_player FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE RESTRICT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
             "CREATE TABLE IF NOT EXISTS warning_sequences(server_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,next_id BIGINT UNSIGNED NOT NULL DEFAULT 1,CONSTRAINT fk_warning_sequences_server FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
             "CREATE TABLE IF NOT EXISTS player_statistics(server_id BIGINT UNSIGNED NOT NULL,player_id BIGINT UNSIGNED NOT NULL,last_seen DATETIME(6) NOT NULL,rounds_completed BIGINT UNSIGNED NOT NULL DEFAULT 0,human_seconds BIGINT UNSIGNED NOT NULL DEFAULT 0,scp_seconds BIGINT UNSIGNED NOT NULL DEFAULT 0,spectator_seconds BIGINT UNSIGNED NOT NULL DEFAULT 0,best_human_kills_round BIGINT UNSIGNED NOT NULL DEFAULT 0,best_scp_kills_round BIGINT UNSIGNED NOT NULL DEFAULT 0,longest_human_life_seconds BIGINT UNSIGNED NOT NULL DEFAULT 0,longest_scp_life_seconds BIGINT UNSIGNED NOT NULL DEFAULT 0,human_kills_as_human BIGINT UNSIGNED NOT NULL DEFAULT 0,human_kills_as_scp BIGINT UNSIGNED NOT NULL DEFAULT 0,scps_destroyed BIGINT UNSIGNED NOT NULL DEFAULT 0,human_deaths BIGINT UNSIGNED NOT NULL DEFAULT 0,scp_deaths BIGINT UNSIGNED NOT NULL DEFAULT 0,classd_escapes_uncuffed BIGINT UNSIGNED NOT NULL DEFAULT 0,fastest_classd_escape_uncuffed_seconds BIGINT UNSIGNED NULL,classd_escapes_cuffed BIGINT UNSIGNED NOT NULL DEFAULT 0,fastest_classd_escape_cuffed_seconds BIGINT UNSIGNED NULL,scientist_escapes_uncuffed BIGINT UNSIGNED NOT NULL DEFAULT 0,fastest_scientist_escape_uncuffed_seconds BIGINT UNSIGNED NULL,scientist_escapes_cuffed BIGINT UNSIGNED NOT NULL DEFAULT 0,fastest_scientist_escape_cuffed_seconds BIGINT UNSIGNED NULL,classd_escorted BIGINT UNSIGNED NOT NULL DEFAULT 0,scientist_escorted BIGINT UNSIGNED NOT NULL DEFAULT 0,warhead_countdowns_started BIGINT UNSIGNED NOT NULL DEFAULT 0,warhead_detonations BIGINT UNSIGNED NOT NULL DEFAULT 0,warhead_countdowns_stopped BIGINT UNSIGNED NOT NULL DEFAULT 0,pocket_entries BIGINT UNSIGNED NOT NULL DEFAULT 0,pocket_escapes BIGINT UNSIGNED NOT NULL DEFAULT 0,longest_pocket_seconds BIGINT UNSIGNED NOT NULL DEFAULT 0,zombies_created BIGINT UNSIGNED NOT NULL DEFAULT 0,generators_activated BIGINT UNSIGNED NOT NULL DEFAULT 0,system_reboots_started BIGINT UNSIGNED NOT NULL DEFAULT 0,tesla_kills_as_079 BIGINT UNSIGNED NOT NULL DEFAULT 0,pink_candies_eaten BIGINT UNSIGNED NOT NULL DEFAULT 0,PRIMARY KEY(server_id,player_id),KEY ix_player_statistics_last_seen(server_id,last_seen),CONSTRAINT fk_player_statistics_server FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,CONSTRAINT fk_player_statistics_player FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",

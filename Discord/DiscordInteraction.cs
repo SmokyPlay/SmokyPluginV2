@@ -60,4 +60,13 @@ namespace SmokyPluginV2.Discord
 
         public string Error { get; set; }
     }
+
+    internal sealed class DiscordRoleAssignmentResult
+    {
+        public bool IsSuccess { get; set; }
+
+        public bool IsGuildMember { get; set; } = true;
+
+        public string Error { get; set; }
+    }
 }

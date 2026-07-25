@@ -342,6 +342,12 @@ namespace SmokyPluginV2.RolePreferences
 
         internal double GetTowerWeight(ReferenceHub hub) => GetEffectiveWeight(hub);
 
+        internal void NotifyAccessGroupsChanged()
+        {
+            if (isRegistered)
+                tower?.MarkProbabilityDirty();
+        }
+
         internal bool TrySetLobbyWeight(Player player, double weight, out double previousWeight, out string error)
         {
             previousWeight = 0;
@@ -801,23 +807,52 @@ namespace SmokyPluginV2.RolePreferences
         private double GetConfiguredWeight(Player player)
         {
             RolePreferencePriorityTier tier = FindTier(player);
-            return tier is null ? GetDefaultWeight() : SanitizeWeight(tier.Weight, GetDefaultWeight());
+            double configured = tier is null
+                ? GetDefaultWeight()
+                : SanitizeWeight(tier.Weight, GetDefaultWeight());
+            double? referralWeight =
+                Plugin.Instance?.PlayerAccess?.GetTemporaryRolePreferenceWeight(player?.UserId);
+            return referralWeight.HasValue
+                ? Math.Max(configured, SanitizeWeight(referralWeight.Value, configured))
+                : configured;
         }
 
         private double GetDefaultWeight() => SanitizeWeight(settings.DefaultWeight, 1);
 
         private RolePreferencePriorityTier FindTier(Player player)
         {
-            string group = player?.Group?.GetKey();
-            if (string.IsNullOrWhiteSpace(group) || settings.PriorityTiers is null)
+            if (player is null || settings.PriorityTiers is null)
+                return null;
+
+            HashSet<string> groups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string currentGroup = player.Group?.GetKey();
+            if (!string.IsNullOrWhiteSpace(currentGroup))
+                groups.Add(currentGroup.Trim());
+
+            if (!string.IsNullOrWhiteSpace(player.UserId) &&
+                Server.PermissionsHandler?.Members.TryGetValue(player.UserId, out string nativeGroup) == true &&
+                !string.IsNullOrWhiteSpace(nativeGroup))
+            {
+                groups.Add(nativeGroup.Trim());
+            }
+
+            groups.UnionWith(
+                Plugin.Instance?.PlayerAccess?.GetResolvedGroups(player.UserId) ??
+                Array.Empty<string>());
+            if (groups.Count == 0)
                 return null;
 
             RolePreferencePriorityTier best = null;
             double bestWeight = double.MinValue;
             foreach (RolePreferencePriorityTier tier in settings.PriorityTiers)
             {
-                if (tier?.Groups is null || !tier.Groups.Any(candidate => string.Equals(candidate?.Trim(), group, StringComparison.OrdinalIgnoreCase)))
+                if (tier?.Groups is null ||
+                    !tier.Groups.Any(candidate =>
+                        !string.IsNullOrWhiteSpace(candidate) &&
+                        groups.Contains(candidate.Trim())))
+                {
                     continue;
+                }
 
                 double weight = SanitizeWeight(tier.Weight, GetDefaultWeight());
                 if (best is null || weight > bestWeight)

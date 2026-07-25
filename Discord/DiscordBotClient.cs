@@ -75,7 +75,7 @@ namespace SmokyPluginV2.Discord
                 Timeout = Timeout.InfiniteTimeSpan,
             };
             httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bot", settings.Token);
-            httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("DiscordBot (https://github.com/SmokyPlay/SmokyPluginV2, 0.18.7)");
+            httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("DiscordBot (https://github.com/SmokyPlay/SmokyPluginV2, 0.19.0)");
         }
 
         public event Action<DiscordMessage> PrefixedMessageReceived;
@@ -180,6 +180,98 @@ namespace SmokyPluginV2.Discord
             }
 
             return new DiscordGuildMemberResult { Error = "Не удалось получить участника Discord после нескольких попыток." };
+        }
+
+        public async Task<DiscordRoleAssignmentResult> AddGuildMemberRoleAsync(ulong discordUserId, ulong roleId)
+        {
+            if (discordUserId == 0 || roleId == 0 || settings.GuildId == 0)
+                return new DiscordRoleAssignmentResult { Error = "Некорректный Discord, Guild или Role ID." };
+
+            int attempts = 0;
+            while (!cancellation.IsCancellationRequested && attempts++ < 3)
+            {
+                using (HttpRequestMessage request = new HttpRequestMessage(
+                           HttpMethod.Put,
+                           $"guilds/{settings.GuildId}/members/{discordUserId}/roles/{roleId}"))
+                using (HttpResponseMessage response = await SendWithHardTimeoutAsync(request, cancellation.Token).ConfigureAwait(false))
+                {
+                    string responseText = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    if (response.IsSuccessStatusCode)
+                        return new DiscordRoleAssignmentResult { IsSuccess = true };
+
+                    if (response.StatusCode == HttpStatusCode.NotFound)
+                    {
+                        return new DiscordRoleAssignmentResult
+                        {
+                            IsGuildMember = false,
+                            Error = "Связанный пользователь не состоит на Discord-сервере или роль не существует.",
+                        };
+                    }
+
+                    if ((int)response.StatusCode == 429)
+                    {
+                        Dictionary<string, object> rateLimit = Json.DeserializeObject(responseText);
+                        double retrySeconds = rateLimit != null && rateLimit.TryGetValue("retry_after", out object retry)
+                            ? Convert.ToDouble(retry, CultureInfo.InvariantCulture)
+                            : 1d;
+                        await Task.Delay(TimeSpan.FromSeconds(Math.Max(0.1d, retrySeconds)), cancellation.Token).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    return new DiscordRoleAssignmentResult
+                    {
+                        Error = $"Discord вернул {(int)response.StatusCode}: {responseText}",
+                    };
+                }
+            }
+
+            return new DiscordRoleAssignmentResult { Error = "Не удалось назначить Discord-роль после нескольких попыток." };
+        }
+
+        public async Task<DiscordRoleAssignmentResult> RemoveGuildMemberRoleAsync(ulong discordUserId, ulong roleId)
+        {
+            if (discordUserId == 0 || roleId == 0 || settings.GuildId == 0)
+                return new DiscordRoleAssignmentResult { Error = "Некорректный Discord, Guild или Role ID." };
+
+            int attempts = 0;
+            while (!cancellation.IsCancellationRequested && attempts++ < 3)
+            {
+                using (HttpRequestMessage request = new HttpRequestMessage(
+                           HttpMethod.Delete,
+                           $"guilds/{settings.GuildId}/members/{discordUserId}/roles/{roleId}"))
+                using (HttpResponseMessage response = await SendWithHardTimeoutAsync(request, cancellation.Token).ConfigureAwait(false))
+                {
+                    string responseText = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    if (response.IsSuccessStatusCode)
+                        return new DiscordRoleAssignmentResult { IsSuccess = true };
+
+                    if (response.StatusCode == HttpStatusCode.NotFound)
+                    {
+                        return new DiscordRoleAssignmentResult
+                        {
+                            IsGuildMember = false,
+                            Error = "Связанный пользователь не состоит на Discord-сервере или роль не существует.",
+                        };
+                    }
+
+                    if ((int)response.StatusCode == 429)
+                    {
+                        Dictionary<string, object> rateLimit = Json.DeserializeObject(responseText);
+                        double retrySeconds = rateLimit != null && rateLimit.TryGetValue("retry_after", out object retry)
+                            ? Convert.ToDouble(retry, CultureInfo.InvariantCulture)
+                            : 1d;
+                        await Task.Delay(TimeSpan.FromSeconds(Math.Max(0.1d, retrySeconds)), cancellation.Token).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    return new DiscordRoleAssignmentResult
+                    {
+                        Error = $"Discord вернул {(int)response.StatusCode}: {responseText}",
+                    };
+                }
+            }
+
+            return new DiscordRoleAssignmentResult { Error = "Не удалось снять Discord-роль после нескольких попыток." };
         }
 
         public void Dispose()
@@ -495,6 +587,16 @@ namespace SmokyPluginV2.Discord
                         ["description"] = "Проверить состояние привязки игрового аккаунта",
                         ["type"] = 1,
                     });
+                    if (Plugin.Instance?.Config?.EarnedPrivileges?.Referrals?.IsEnabled == true &&
+                        Plugin.Instance.Referrals != null)
+                    {
+                        commandList.Add(new Dictionary<string, object>
+                        {
+                            ["name"] = "referral",
+                            ["description"] = "Показать ваш реферальный код и прогресс приглашений",
+                            ["type"] = 1,
+                        });
+                    }
                 }
                 if (Plugin.Instance?.Config?.Statistics?.IsEnabled == true && Plugin.Instance.Database != null)
                 {

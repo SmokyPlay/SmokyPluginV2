@@ -25,6 +25,9 @@ namespace SmokyPluginV2
         [Description("Persistent player and server statistics settings.")]
         public StatisticsSettings Statistics { get; set; } = new StatisticsSettings();
 
+        [Description("Privileges earned from persistent player data.")]
+        public EarnedPrivilegeSettings EarnedPrivileges { get; set; } = new EarnedPrivilegeSettings();
+
         [Description("Settings for enabling friendly fire only after a round has ended.")]
         public EndRoundFriendlyFireSettings EndRoundFriendlyFire { get; set; } = new EndRoundFriendlyFireSettings();
 
@@ -67,6 +70,36 @@ namespace SmokyPluginV2
         [Description("Whether player and server statistics are collected during active rounds.")]
         public bool IsEnabled { get; set; } = true;
 
+    }
+
+    public sealed class EarnedPrivilegeSettings
+    {
+        [Description("Required total playtime in hours. Human, SCP and spectator time from statistics are included.")]
+        public double RequiredHours { get; set; } = 100;
+
+        [Description("Remote Admin group granted while the player meets the required playtime. The same group must be present in discord.role_groups.")]
+        public string GroupName { get; set; } = "pearl";
+
+        [Description("Referral program settings. The earned group above is also granted for enough qualified referrals.")]
+        public ReferralSettings Referrals { get; set; } = new ReferralSettings();
+    }
+
+    public sealed class ReferralSettings
+    {
+        [Description("Whether the referral program is enabled.")]
+        public bool IsEnabled { get; set; } = true;
+
+        [Description("Maximum total playtime in minutes at which a player may enter a referral code.")]
+        public int CodeEntryMaxMinutes { get; set; } = 15;
+
+        [Description("Total network playtime in minutes required for an invited player to qualify.")]
+        public int QualificationMinutes { get; set; } = 120;
+
+        [Description("How many qualified referrals grant the earned privilege group.")]
+        public int RequiredReferrals { get; set; } = 5;
+
+        [Description("Temporary role-selection weight for an invited player until the referral qualifies.")]
+        public double PendingReferralWeight { get; set; } = 1.25;
     }
 
     public sealed class GeneralBroadcastSettings
@@ -137,7 +170,7 @@ namespace SmokyPluginV2
         [Description("Relative selection weight for players whose group is not present in priority_tiers.")]
         public double DefaultWeight { get; set; } = 1;
 
-        [Description("Priority tiers. A player's current Remote Admin group is matched case-insensitively; the highest-weight match wins.")]
+        [Description("Priority tiers. All currently resolved Remote Admin groups are matched case-insensitively; the highest-weight match wins.")]
         public List<RolePreferencePriorityTier> PriorityTiers { get; set; } = new List<RolePreferencePriorityTier>
         {
             new RolePreferencePriorityTier
@@ -364,6 +397,9 @@ namespace SmokyPluginV2
 
         [Description("How many minutes a one-time link code remains valid.")]
         public int CodeLifetimeMinutes { get; set; } = 5;
+
+        [Description("Discord role granted while a Steam account is linked. Set to 0 to disable. A matching discord.role_groups entry is optional.")]
+        public ulong LinkedDiscordRoleId { get; set; } = 0;
 
         [Description("Do not replace an RA group explicitly assigned to the Steam UserId in config_remoteadmin.txt.")]
         public bool PreserveNativeGroup { get; set; } = true;

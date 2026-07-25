@@ -9,8 +9,6 @@ namespace SmokyPluginV2.Patches
 
     using HarmonyLib;
 
-    using SmokyPluginV2.Discord;
-
     [HarmonyPatch(
         typeof(Exiled.Events.Commands.Reload.RemoteAdmin),
         nameof(Exiled.Events.Commands.Reload.RemoteAdmin.Execute))]
@@ -22,7 +20,7 @@ namespace SmokyPluginV2.Patches
             if (!__result)
                 return;
 
-            DiscordLogService.Current?.RefreshLinkedPlayerGroups();
+            Plugin.Instance?.PlayerAccess?.RefreshOnlinePlayers(true);
         }
     }
 

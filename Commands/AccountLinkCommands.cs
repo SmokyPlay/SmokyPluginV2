@@ -43,10 +43,10 @@ namespace SmokyPluginV2.Commands
             if (!service.TryLink(code, player.UserId, out ulong discordUserId, out response))
                 return false;
 
-            if (Plugin.Instance.DiscordLogs != null)
+            if (Plugin.Instance.PlayerAccess != null)
             {
-                Plugin.Instance.DiscordLogs.SynchronizeLinkedPlayer(player, true);
-                response = $"Аккаунт успешно привязан к Discord `{discordUserId}`. Актуальные Discord-роли запрошены.";
+                Plugin.Instance.PlayerAccess.Synchronize(player, true);
+                response = $"Аккаунт успешно привязан к Discord `{discordUserId}`. Синхронизация привилегий запущена.";
             }
             else
             {
@@ -88,11 +88,14 @@ namespace SmokyPluginV2.Commands
                 return false;
             }
 
-            if (!service.TryUnlinkPlayer(player.UserId, out _, out response))
+            if (!service.TryUnlinkPlayer(player.UserId, out ulong previousDiscordUserId, out response))
                 return false;
 
-            Plugin.Instance.DiscordLogs?.RemoveSynchronizedGroup(player);
-            response = "Игровой аккаунт отвязан от Discord. Временная Discord-группа снята.";
+            Plugin.Instance.PlayerAccess?.SynchronizeAfterUnlink(
+                player.UserId,
+                previousDiscordUserId,
+                true);
+            response = "Игровой аккаунт отвязан от Discord. Игровая группа будет пересчитана по привилегиям MariaDB.";
             return true;
         }
     }

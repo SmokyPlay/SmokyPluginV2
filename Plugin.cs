@@ -10,6 +10,8 @@ namespace SmokyPluginV2
     using SmokyPluginV2.AccountLinks;
     using SmokyPluginV2.Database;
     using SmokyPluginV2.Discord;
+    using SmokyPluginV2.Privileges;
+    using SmokyPluginV2.Referrals;
     using SmokyPluginV2.RolePreferences;
     using SmokyPluginV2.Statistics;
 
@@ -32,6 +34,10 @@ namespace SmokyPluginV2
         private Handlers.DiscordGameEventHandler discordGameEventHandler;
         private Handlers.DiscordModerationHandler discordModerationHandler;
         private DiscordLogService discordLogService;
+        private DiscordRoleSynchronizationService discordRoleSynchronizationService;
+        private PlayerPrivilegeService playerPrivilegeService;
+        private PlayerAccessService playerAccessService;
+        private ReferralService referralService;
         private Harmony harmony;
         private Warnings.WarningService warningService;
 
@@ -50,6 +56,14 @@ namespace SmokyPluginV2
 
         internal DiscordLogService DiscordLogs => discordLogService;
 
+        internal DiscordRoleSynchronizationService DiscordRoles => discordRoleSynchronizationService;
+
+        internal PlayerPrivilegeService PlayerPrivileges => playerPrivilegeService;
+
+        internal PlayerAccessService PlayerAccess => playerAccessService;
+
+        internal ReferralService Referrals => referralService;
+
         internal Handlers.LateJoinSpawnHandler LateJoinSpawns => lateJoinSpawnHandler;
 
         internal RolePreferenceService RolePreferences => rolePreferenceService;
@@ -64,7 +78,7 @@ namespace SmokyPluginV2
         public override string Author => "Smoky";
 
         /// <inheritdoc />
-        public override Version Version => new(0, 18, 7);
+        public override Version Version => new(0, 20, 0);
 
         /// <inheritdoc />
         public override Version RequiredExiledVersion => new(9, 14, 2);
@@ -80,6 +94,10 @@ namespace SmokyPluginV2
                 {
                     SharedDatabaseSettings sharedDatabaseSettings = SharedDatabaseConfig.Load();
                     databaseService = new MariaDbService(sharedDatabaseSettings, Config.Database.ServerName);
+                    referralService = new ReferralService(
+                        databaseService,
+                        Config.EarnedPrivileges?.Referrals);
+                    referralService.Register();
                     bool importLegacyYaml = Config.Database.ImportLegacyYaml;
                     if (Config.Warnings?.IsEnabled == true)
                         warningService = new Warnings.WarningService(databaseService, importLegacyYaml);
@@ -100,6 +118,8 @@ namespace SmokyPluginV2
                     warningService = null;
                     accountLinkService?.Dispose();
                     accountLinkService = null;
+                    referralService?.Dispose();
+                    referralService = null;
                     databaseService?.Dispose();
                     databaseService = null;
                 }
@@ -188,6 +208,21 @@ namespace SmokyPluginV2
                 }
             }
 
+            if (databaseService != null)
+            {
+                playerPrivilegeService = new PlayerPrivilegeService(
+                    databaseService,
+                    Config.EarnedPrivileges);
+                if (discordLogService != null)
+                    discordRoleSynchronizationService = new DiscordRoleSynchronizationService(discordLogService);
+                playerAccessService = new PlayerAccessService(
+                    playerPrivilegeService,
+                    discordRoleSynchronizationService,
+                    Config.Discord);
+                playerAccessService.Register();
+                playerAccessService.RefreshOnlinePlayers();
+            }
+
             base.OnEnabled();
         }
 
@@ -196,6 +231,13 @@ namespace SmokyPluginV2
         {
             statisticsService?.Dispose();
             statisticsService = null;
+
+            playerAccessService?.Dispose();
+            playerAccessService = null;
+            discordRoleSynchronizationService = null;
+            playerPrivilegeService = null;
+            referralService?.Dispose();
+            referralService = null;
 
             warningService?.Dispose();
             warningService = null;
@@ -290,6 +332,8 @@ namespace SmokyPluginV2
         {
             ReloadRolePreferenceConfiguration();
             discordLogService?.ReloadRoleGroupMappings(Config?.Discord);
+            referralService?.ReloadSettings(Config?.EarnedPrivileges?.Referrals);
+            playerAccessService?.ReloadSettings(Config?.EarnedPrivileges, Config?.Discord);
         }
     }
 }

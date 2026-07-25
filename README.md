@@ -2,7 +2,7 @@
 
 EXILED 9.14.2 plugin for SCP: Secret Laboratory 14.2.7.
 
-Version 0.18.7 stores player statistics, server statistics, account links and warnings in MariaDB. Multiple SCP:SL instances share one database configuration and are separated automatically by their game ports.
+Version 0.20.0 stores player statistics, server statistics, account links, referrals and warnings in MariaDB. Multiple SCP:SL instances share one database configuration and are separated automatically by their game ports.
 
 ## Current features
 
@@ -113,6 +113,15 @@ smoky_plugin_v2:
     import_legacy_yaml: true
   statistics:
     is_enabled: true
+  earned_privileges:
+    required_hours: 100
+    group_name: pearl
+    referrals:
+      is_enabled: true
+      code_entry_max_minutes: 15
+      qualification_minutes: 120
+      required_referrals: 5
+      pending_referral_weight: 1.25
   end_round_friendly_fire:
     is_enabled: true
   late_join_spawn:
@@ -203,6 +212,7 @@ smoky_plugin_v2:
     account_linking:
       is_enabled: true
       code_lifetime_minutes: 5
+      linked_discord_role_id: 777777777777777777
       preserve_native_group: true
 ```
 
@@ -218,7 +228,7 @@ During the tower lobby, a command sender with the EXILED permission `smokyplugin
 
 At round start a narrowly scoped Harmony postfix allows only registered tower participants who are still Tutorial to pass `RoleAssigner.CheckPlayer`, and only while `RoleAssigner.OnRoundStarted` is executing. The existing atomic SCP and human spawner hooks then replace Tutorial directly with the final role. No intermediate Spectator role is assigned, which avoids a second post-start role swap and duplicate starting inventories.
 
-`priority_tiers` matches the player's current Remote Admin group case-insensitively. `weight` is relative: with one contested slot, weight `2` is twice as likely as one ordinary weight-`1` player, not a guaranteed win. When several slots exist, winners are drawn one at a time without replacement and weights are recalculated after every winner. The configured weight applies in every contested allocation.
+`priority_tiers` matches every currently resolved group case-insensitively: the live RA group, a native `config_remoteadmin.txt` group, database privileges, and all RA groups mapped from effective Discord roles. The highest matching tier weight wins without changing the player's assigned RA group. `weight` is relative: with one contested slot, weight `2` is twice as likely as one ordinary weight-`1` player, not a guaranteed win. When several slots exist, winners are drawn one at a time without replacement and weights are recalculated after every winner. The configured weight applies in every contested allocation.
 
 During the pre-round lobby, a moderator with the EXILED permission `smokyplugin.roleweight` may temporarily replace one online player's effective weight:
 
@@ -258,7 +268,7 @@ The bot responds privately with a one-time game-console command:
 .link ABCDE-FGHIJ
 ```
 
-After the verified player enters it, the plugin stores the Steam ID ↔ Discord User ID link in MariaDB, requests the member's current Discord roles and assigns the first matching `role_groups` entry. The assignment affects only the current connection and is not written to `PermissionsHandler.Members`.
+After the verified player enters it, the plugin stores the Steam ID ↔ Discord User ID link in MariaDB and starts the common privilege synchronization. `linked_discord_role_id`, when non-zero, is granted while the link exists. It does not need a `role_groups` entry; if one is added, the same role can also select an RA group.
 
 Other account commands:
 
@@ -266,11 +276,18 @@ Other account commands:
 /link-status   Discord: show the linked Steam UserId
 /unlink        Discord: remove the link
 .unlink        game console: remove the link
+/referral      Discord: show the permanent referral code and progress
+.ref CODE      game console: accept a referral
+.janitorcard   game console: receive one janitor keycard per round while the referral is pending (alias: .jc)
 ```
 
 Codes are generated with `RandomNumberGenerator`, are bound to the Discord user who requested them, expire after `code_lifetime_minutes`, and are consumed once. Links are one-to-one: a Steam account and a Discord account can each appear only once.
 
-On every player verification the plugin calls Discord's single-member endpoint and uses the current roles; roles are not stored in MariaDB. If Discord is unavailable, the user left the guild, or no mapping exists, no administrative group is granted. With `preserve_native_group: true`, a Steam UserId explicitly present in `config_remoteadmin.txt` is never replaced by Discord synchronization.
+On every player verification the plugin resolves Steam-bound privileges and, when linked, Discord-bound privileges separately, combines them, reconciles managed Discord roles with one member lookup, and assigns the highest matching `role_groups` entry in the game. `earned_privileges.group_name` is active after either `earned_privileges.required_hours` or the configured number of qualified referrals; no computed privilege is stored in another table. After `reload remoteadmin`, the same live synchronization is repeated for every linked online player. With `preserve_native_group: true`, a Steam UserId explicitly present in `config_remoteadmin.txt` keeps the game's native group, while managed Discord roles are still reconciled.
+
+A referral code is permanent and is generated lazily by `/referral` for a linked account. Each player can accept one code with `.ref CODE` before `code_entry_max_minutes`; the number of players using an inviter's code is unlimited. Qualification is derived from aggregate playtime in `player_statistics`; no qualified flag or duplicate playtime is stored. Pending invitees receive `pending_referral_weight`, while the inviter receives the earned group after `required_referrals` invitees each reach `qualification_minutes`.
+
+On unlink, the old Discord ID is retained only for the cleanup pass. The dedicated link role is removed, but existing privilege roles are preserved because Discord roles may have been granted manually. An online game player is recalculated using only Steam-bound privileges because the Discord account is no longer linked. The two source lists are deliberately not combined after the link has been deleted.
 
 ## Warning commands
 

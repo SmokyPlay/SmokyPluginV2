@@ -17,6 +17,7 @@ namespace SmokyPluginV2.Discord
 
     using SmokyPluginV2.AccountLinks;
     using SmokyPluginV2.Database;
+    using SmokyPluginV2.Referrals;
     using SmokyPluginV2.Statistics;
 
     internal sealed class DiscordLogService : IDisposable
@@ -239,49 +240,10 @@ namespace SmokyPluginV2.Discord
                 synchronizedGroups.TryRemove(playerUserId, out _);
         }
 
-        internal void ReapplySynchronizedGroups()
+        internal void RefreshLinkedPlayerGroups(bool remoteAdminReloaded = false)
         {
-            if (disposed || synchronizedGroups.IsEmpty)
-                return;
-
-            int reapplied = 0;
-            foreach (KeyValuePair<string, string> entry in synchronizedGroups)
-            {
-                string playerUserId = entry.Key;
-                Player player = Player.Get(playerUserId);
-                if (player is null || !player.IsConnected)
-                {
-                    synchronizedGroups.TryRemove(playerUserId, out _);
-                    continue;
-                }
-
-                if (settings.AccountLinking?.PreserveNativeGroup == true &&
-                    Server.PermissionsHandler?.Members.ContainsKey(playerUserId) == true)
-                {
-                    synchronizedGroups.TryRemove(playerUserId, out _);
-                    Log.Debug($"[AccountLinks] Native RA group preserved for {playerUserId} after Remote Admin reload.");
-                    continue;
-                }
-
-                if (Server.PermissionsHandler is null ||
-                    !Server.PermissionsHandler.Groups.TryGetValue(entry.Value, out UserGroup refreshedGroup))
-                {
-                    synchronizedGroups.TryRemove(playerUserId, out _);
-                    Log.Warn($"[AccountLinks] Could not restore Discord RA group '{entry.Value}' for {playerUserId} after Remote Admin reload because the group no longer exists.");
-                    continue;
-                }
-
-                player.Group = refreshedGroup;
-                reapplied++;
-            }
-
-            if (reapplied > 0)
-                Log.Info($"[AccountLinks] Restored {reapplied} Discord-synchronized RA group(s) after Remote Admin reload.");
-        }
-
-        internal void RefreshLinkedPlayerGroups()
-        {
-            ReapplySynchronizedGroups();
+            if (remoteAdminReloaded)
+                synchronizedGroups.Clear();
 
             if (disposed || settings.AccountLinking?.IsEnabled != true)
                 return;
@@ -301,8 +263,20 @@ namespace SmokyPluginV2.Discord
                     continue;
 
                 if (settings.AccountLinking.PreserveNativeGroup &&
-                    Server.PermissionsHandler?.Members.ContainsKey(playerUserId) == true)
+                    Server.PermissionsHandler?.Members.TryGetValue(playerUserId, out string nativeGroupName) == true)
                 {
+                    synchronizedGroups.TryRemove(playerUserId, out _);
+                    if (Server.PermissionsHandler.Groups.TryGetValue(nativeGroupName, out UserGroup nativeGroup))
+                    {
+                        string currentGroupName = player.Group?.GetKey();
+                        if (!string.Equals(currentGroupName, nativeGroupName, StringComparison.OrdinalIgnoreCase))
+                            player.Group = nativeGroup;
+                    }
+                    else
+                    {
+                        Log.Warn($"[AccountLinks] Native RA group '{nativeGroupName}' for {playerUserId} is not defined after Remote Admin reload.");
+                    }
+
                     continue;
                 }
 
@@ -349,10 +323,9 @@ namespace SmokyPluginV2.Discord
                 !string.IsNullOrWhiteSpace(mapping.RemoteAdminGroup));
 
             Log.Info($"[AccountLinks] Reloaded {validMappings} Discord-to-Remote-Admin role mapping(s) from plugin configuration.");
-            RefreshLinkedPlayerGroups();
         }
 
-        private async Task<DiscordGuildMemberResult> GetGuildMemberResultAsync(ulong discordUserId)
+        internal async Task<DiscordGuildMemberResult> GetGuildMemberResultAsync(ulong discordUserId)
         {
             try
             {
@@ -361,6 +334,30 @@ namespace SmokyPluginV2.Discord
             catch (Exception exception)
             {
                 return new DiscordGuildMemberResult { Error = exception.Message };
+            }
+        }
+
+        internal async Task<DiscordRoleAssignmentResult> AddGuildMemberRoleAsync(ulong discordUserId, ulong roleId)
+        {
+            try
+            {
+                return await client.AddGuildMemberRoleAsync(discordUserId, roleId).ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                return new DiscordRoleAssignmentResult { Error = exception.Message };
+            }
+        }
+
+        internal async Task<DiscordRoleAssignmentResult> RemoveGuildMemberRoleAsync(ulong discordUserId, ulong roleId)
+        {
+            try
+            {
+                return await client.RemoveGuildMemberRoleAsync(discordUserId, roleId).ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                return new DiscordRoleAssignmentResult { Error = exception.Message };
             }
         }
 
@@ -473,6 +470,42 @@ namespace SmokyPluginV2.Discord
                 };
             }
 
+            if (commandName == "referral")
+            {
+                ReferralService referrals = Plugin.Instance?.Referrals;
+                if (referrals == null ||
+                    Plugin.Instance?.Config?.EarnedPrivileges?.Referrals?.IsEnabled != true)
+                {
+                    return Ephemeral("Реферальная программа сейчас недоступна.");
+                }
+
+                StatisticsService referralStatistics = Plugin.Instance?.Statistics;
+                if (referralStatistics != null &&
+                    !referralStatistics.TryFlushPendingWrites(out string synchronizationError))
+                {
+                    return Ephemeral("❌ " + synchronizationError);
+                }
+
+                if (!referrals.TryGetOrCreateStatus(
+                        interaction.UserId,
+                        out ReferralStatus referralStatus,
+                        out string referralError))
+                {
+                    return Ephemeral("❌ " + referralError);
+                }
+
+                return new DiscordInteractionResponse
+                {
+                    Embed = ReferralEmbedFormatter.Create(
+                        referralStatus,
+                        Plugin.Instance?.Config?.EarnedPrivileges?.GroupName,
+                        referrals.CodeEntryMaxMinutes,
+                        referrals.QualificationMinutes,
+                        referrals.RequiredReferrals),
+                    Ephemeral = true,
+                };
+            }
+
             if (links is null || settings.AccountLinking?.IsEnabled != true)
                 return Ephemeral("Привязка игровых аккаунтов отключена.");
 
@@ -499,14 +532,9 @@ namespace SmokyPluginV2.Discord
                     if (!links.TryUnlinkDiscord(interaction.UserId, out string playerUserId, out string unlinkError))
                         return Ephemeral($"❌ {unlinkError}");
 
-                    MainThreadDispatcher.Dispatch(
-                        () =>
-                        {
-                            Player onlinePlayer = Player.Get(playerUserId);
-                            if (onlinePlayer != null && onlinePlayer.IsConnected)
-                                RemoveSynchronizedGroup(onlinePlayer);
-                        },
-                        MainThreadDispatcher.DispatchTime.FixedUpdate);
+                    Plugin.Instance?.PlayerAccess?.SynchronizeAfterUnlink(
+                        playerUserId,
+                        interaction.UserId);
                     return Ephemeral($"✅ Игровой аккаунт `{playerUserId}` отвязан от Discord.");
 
                 case "link-status":
@@ -634,9 +662,18 @@ namespace SmokyPluginV2.Discord
                 return;
             }
 
-            player.Group = group;
             synchronizedGroups[playerUserId] = groupName;
-            Log.Info($"[AccountLinks] Assigned temporary RA group '{groupName}' to {playerUserId} from Discord user {discordUserId}.");
+            string currentGroupName = player.Group?.GetKey();
+            if (!string.Equals(currentGroupName, groupName, StringComparison.OrdinalIgnoreCase))
+            {
+                player.Group = group;
+                Log.Info($"[AccountLinks] Assigned temporary RA group '{groupName}' to {playerUserId} from Discord user {discordUserId}.");
+            }
+            else
+            {
+                Log.Debug($"[AccountLinks] Confirmed existing temporary RA group '{groupName}' for {playerUserId} from Discord user {discordUserId}.");
+            }
+
             if (notifyPlayer)
                 player.SendConsoleMessage($"Discord-роли синхронизированы. Назначена группа Remote Admin: {groupName}.", "green");
         }

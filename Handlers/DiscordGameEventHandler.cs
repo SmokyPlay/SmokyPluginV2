@@ -188,13 +188,11 @@ namespace SmokyPluginV2.Handlers
             string address = Plugin.Instance.Config.Discord.LogIpAddresses ? ev.Player.IPAddress : "REDACTED";
             Game(Config.PlayerJoined, $":arrow_right: **{DiscordLogService.Escape(ev.Player.Nickname)} ({DiscordLogService.Escape(ev.Player.UserId)}) [{DiscordLogService.Escape(address)}] has joined the game.**");
             Logs?.UpdatePresence();
-            Logs?.SynchronizeLinkedPlayer(ev.Player);
         }
 
         private void OnLeft(LeftEventArgs ev)
         {
             Game(Config.PlayerLeft, $":arrow_left: **{P(ev.Player)} has left the server.**");
-            Logs?.ForgetSynchronizedGroup(ev.Player);
             Logs?.UpdatePresence(Math.Max(0, GameServer.PlayerCount - 1));
         }
 

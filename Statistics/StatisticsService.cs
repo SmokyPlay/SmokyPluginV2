@@ -42,6 +42,7 @@ namespace SmokyPluginV2.Statistics
         private readonly Thread writerThread;
         private readonly Dictionary<string, RoundPlayerState> players = new Dictionary<string, RoundPlayerState>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, PendingEscape> pendingEscapes = new Dictionary<string, PendingEscape>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, Scp106AttackCredit> scp106AttackCredits = new Dictionary<string, Scp106AttackCredit>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<Generator, string> generatorActivators = new Dictionary<Generator, string>();
         private DateTime roundStartedUtc;
         private bool roundActive;
@@ -71,6 +72,19 @@ namespace SmokyPluginV2.Statistics
 
         public bool IsPausedForCurrentRound => roundActive && recordingPaused;
 
+        public long GetUnpersistedPlaytimeSeconds(string playerUserId)
+        {
+            if (!IsRecording || string.IsNullOrWhiteSpace(playerUserId) ||
+                !players.TryGetValue(playerUserId, out RoundPlayerState state) ||
+                !state.RoleIntervalStartedUtc.HasValue ||
+                !IsTracked(state.Category))
+            {
+                return 0;
+            }
+
+            return ElapsedSeconds(state.RoleIntervalStartedUtc.Value, DateTime.UtcNow);
+        }
+
         public void Register()
         {
             ServerHandlers.WaitingForPlayers += OnWaitingForPlayers;
@@ -79,6 +93,7 @@ namespace SmokyPluginV2.Statistics
             ServerHandlers.RestartingRound += OnRestartingRound;
             PlayerHandlers.Verified += OnVerified;
             PlayerHandlers.Left += OnLeft;
+            PlayerHandlers.Hurting += OnHurting;
             PlayerHandlers.Died += OnDied;
             PlayerHandlers.ChangingRole += OnChangingRole;
             PlayerHandlers.Escaping += OnEscaping;
@@ -107,6 +122,7 @@ namespace SmokyPluginV2.Statistics
             ServerHandlers.RestartingRound -= OnRestartingRound;
             PlayerHandlers.Verified -= OnVerified;
             PlayerHandlers.Left -= OnLeft;
+            PlayerHandlers.Hurting -= OnHurting;
             PlayerHandlers.Died -= OnDied;
             PlayerHandlers.ChangingRole -= OnChangingRole;
             PlayerHandlers.Escaping -= OnEscaping;
@@ -268,6 +284,7 @@ namespace SmokyPluginV2.Statistics
         {
             players.Clear();
             pendingEscapes.Clear();
+            scp106AttackCredits.Clear();
             activePocketStarts.Clear();
             generatorActivators.Clear();
             recordingPaused = false;
@@ -347,7 +364,22 @@ namespace SmokyPluginV2.Statistics
                 players.Remove(ev.Player.UserId);
             }
             activePocketStarts.TryRemove(MariaDbService.NormalizeSteamId(ev.Player.UserId), out _);
+            scp106AttackCredits.Remove(ev.Player.UserId);
             SafePlayerUpdate(ev.Player.UserId, ev.Player.Nickname, new PlayerStatDelta(), now);
+        }
+
+        private void OnHurting(HurtingEventArgs ev)
+        {
+            if (!IsRecording || !ev.IsAllowed || !IsRealPlayer(ev.Player) || !IsRealPlayer(ev.Attacker) ||
+                ev.Attacker == ev.Player || ev.Attacker.Role.Type != RoleTypeId.Scp106)
+                return;
+
+            scp106AttackCredits[ev.Player.UserId] = new Scp106AttackCredit
+            {
+                AttackerUserId = ev.Attacker.UserId,
+                AttackerNickname = ev.Attacker.Nickname,
+                AttackedAtUtc = DateTime.UtcNow,
+            };
         }
 
         private void OnChangingRole(ChangingRoleEventArgs ev)
@@ -375,6 +407,7 @@ namespace SmokyPluginV2.Statistics
                 return;
             DateTime now = DateTime.UtcNow;
             RoundPlayerState victimState = GetState(ev.Player);
+            bool victimWasInPocket = victimState.InPocket;
             victimState.Category = Classify(ev.TargetOldRole);
             FlushRoleInterval(victimState, now);
             FinalizeLife(victimState, now);
@@ -392,7 +425,9 @@ namespace SmokyPluginV2.Statistics
                 SafePlayerUpdate(ev.Player.UserId, ev.Player.Nickname, victimDelta, now);
 
             Player attacker = ev.Attacker;
-            if (IsRealPlayer(attacker) && attacker != ev.Player)
+            bool hasCreditableAttacker = IsRealPlayer(attacker) && attacker != ev.Player;
+            string scpKillCreditedUserId = null;
+            if (hasCreditableAttacker)
             {
                 RoleCategory attackerCategory = Classify(attacker.Role.Type);
                 PlayerStatDelta attackerDelta = new PlayerStatDelta();
@@ -405,6 +440,7 @@ namespace SmokyPluginV2.Statistics
                 {
                     attackerDelta.Increment("human_kills_as_scp");
                     GetState(attacker).ScpKillsThisRound++;
+                    scpKillCreditedUserId = attacker.UserId;
                 }
                 else if (victim == RoleCategory.Scp && attackerCategory == RoleCategory.Human)
                 {
@@ -414,12 +450,31 @@ namespace SmokyPluginV2.Statistics
                     SafePlayerUpdate(attacker.UserId, attacker.Nickname, attackerDelta, now);
             }
 
-            if (victim == RoleCategory.Human &&
-                ev.DamageHandler?.Type.ToString().IndexOf("Tesla", StringComparison.OrdinalIgnoreCase) >= 0 &&
+            if (victim == RoleCategory.Human && !hasCreditableAttacker && IsScp106RelatedDamage(ev) &&
+                scp106AttackCredits.TryGetValue(ev.Player.UserId, out Scp106AttackCredit scp106Credit) &&
+                (scp106Credit.PocketEntryConfirmed || victimWasInPocket || (now - scp106Credit.AttackedAtUtc).TotalSeconds <= 10))
+            {
+                SafePlayerUpdate(
+                    scp106Credit.AttackerUserId,
+                    scp106Credit.AttackerNickname,
+                    new PlayerStatDelta().Increment("human_kills_as_scp"),
+                    now);
+                IncrementScpKillsThisRound(scp106Credit.AttackerUserId);
+                scpKillCreditedUserId = scp106Credit.AttackerUserId;
+            }
+            scp106AttackCredits.Remove(ev.Player.UserId);
+
+            if (victim == RoleCategory.Human && IsTeslaDamage(ev) &&
                 !string.IsNullOrWhiteSpace(lastTesla079UserId) &&
                 (now - lastTesla079AtUtc).TotalSeconds <= 8)
             {
-                SafePlayerUpdate(lastTesla079UserId, null, new PlayerStatDelta().Increment("tesla_kills_as_079"), now);
+                PlayerStatDelta teslaDelta = new PlayerStatDelta().Increment("tesla_kills_as_079");
+                if (!string.Equals(scpKillCreditedUserId, lastTesla079UserId, StringComparison.OrdinalIgnoreCase))
+                {
+                    teslaDelta.Increment("human_kills_as_scp");
+                    IncrementScpKillsThisRound(lastTesla079UserId);
+                }
+                SafePlayerUpdate(lastTesla079UserId, null, teslaDelta, now);
             }
         }
 
@@ -485,6 +540,8 @@ namespace SmokyPluginV2.Statistics
             state.PocketSeconds = 0;
             state.PocketIntervalStartedUtc = now;
             activePocketStarts[MariaDbService.NormalizeSteamId(player.UserId)] = now;
+            if (scp106AttackCredits.TryGetValue(player.UserId, out Scp106AttackCredit credit))
+                credit.PocketEntryConfirmed = true;
             SafePlayerUpdate(player.UserId, player.Nickname, new PlayerStatDelta().Increment("pocket_entries"), now);
             Log.Debug($"[Statistics] Pocket entry registered for {player.UserId}.");
         }
@@ -503,7 +560,10 @@ namespace SmokyPluginV2.Statistics
             long stay = FinishPocket(state, now);
             PlayerStatDelta delta = new PlayerStatDelta().Max("longest_pocket_seconds", stay);
             if (ev.IsSuccessful)
+            {
                 delta.Increment("pocket_escapes");
+                scp106AttackCredits.Remove(player.UserId);
+            }
             SafePlayerUpdate(player.UserId, player.Nickname, delta, now);
             Log.Debug($"[Statistics] Pocket stay registered for {player.UserId}: {stay} second(s), escaped={ev.IsSuccessful}.");
         }
@@ -724,6 +784,7 @@ namespace SmokyPluginV2.Statistics
             recordingPaused = false;
             players.Clear();
             pendingEscapes.Clear();
+            scp106AttackCredits.Clear();
             activePocketStarts.Clear();
             generatorActivators.Clear();
         }
@@ -732,6 +793,7 @@ namespace SmokyPluginV2.Statistics
         {
             players.Remove(userId);
             pendingEscapes.Remove(userId);
+            scp106AttackCredits.Remove(userId);
             foreach (Generator generator in generatorActivators
                 .Where(pair => string.Equals(pair.Value, userId, StringComparison.OrdinalIgnoreCase))
                 .Select(pair => pair.Key)
@@ -753,7 +815,19 @@ namespace SmokyPluginV2.Statistics
 
         private void SafePlayerUpdate(string userId, string nickname, PlayerStatDelta delta, DateTime now)
         {
-            EnqueueWrite(() => database.UpdatePlayerStatistics(userId, nickname, delta, now), "player " + userId);
+            long addedPlaytimeSeconds = GetAddedPlaytimeSeconds(delta);
+            EnqueueWrite(
+                () =>
+                {
+                    database.UpdatePlayerStatistics(userId, nickname, delta, now);
+                    if (addedPlaytimeSeconds > 0)
+                    {
+                        Plugin.Instance?.Referrals?.OnPlaytimePersisted(
+                            userId,
+                            addedPlaytimeSeconds);
+                    }
+                },
+                "player " + userId);
         }
 
         private void SafeServerUpdate(ServerStatDelta delta)
@@ -784,13 +858,51 @@ namespace SmokyPluginV2.Statistics
 
         private static IEnumerable<Player> OnlinePlayers() => Player.List.Where(IsRealPlayer);
 
-        private static bool IsRealPlayer(Player player) => player != null && player.IsConnected && !player.IsHost && !string.IsNullOrWhiteSpace(player.UserId);
+        private static bool IsRealPlayer(Player player) =>
+            player != null &&
+            player.IsConnected &&
+            !player.IsHost &&
+            !player.IsNPC &&
+            MariaDbService.IsSteamUserId(player.UserId);
 
         private static long ElapsedSeconds(DateTime start, DateTime end) => Math.Max(0L, (long)Math.Round((end - start).TotalSeconds));
+
+        private static long GetAddedPlaytimeSeconds(PlayerStatDelta delta)
+        {
+            if (delta?.Add == null)
+                return 0;
+
+            long total = 0;
+            foreach (string column in new[] { "human_seconds", "scp_seconds", "spectator_seconds" })
+            {
+                if (delta.Add.TryGetValue(column, out long seconds) && seconds > 0)
+                    total = total > long.MaxValue - seconds ? long.MaxValue : total + seconds;
+            }
+
+            return total;
+        }
 
         private static bool IsTracked(RoleCategory category) => category == RoleCategory.Human || category == RoleCategory.Scp || category == RoleCategory.Spectator;
 
         private static bool IsLiving(RoleCategory category) => category == RoleCategory.Human || category == RoleCategory.Scp;
+
+        private static bool IsTeslaDamage(DiedEventArgs ev) =>
+            ev.DamageHandler?.Type.ToString().IndexOf("Tesla", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        private static bool IsScp106RelatedDamage(DiedEventArgs ev)
+        {
+            string damageType = ev.DamageHandler?.Type.ToString();
+            return damageType != null &&
+                (damageType.IndexOf("106", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 damageType.IndexOf("Pocket", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 damageType.IndexOf("Corrod", StringComparison.OrdinalIgnoreCase) >= 0);
+        }
+
+        private void IncrementScpKillsThisRound(string userId)
+        {
+            if (!string.IsNullOrWhiteSpace(userId) && players.TryGetValue(userId, out RoundPlayerState state))
+                state.ScpKillsThisRound++;
+        }
 
         private static RoleCategory Classify(RoleTypeId role)
         {
@@ -821,6 +933,14 @@ namespace SmokyPluginV2.Statistics
             public EscapeScenario Scenario { get; set; }
             public string CufferUserId { get; set; }
             public string CufferNickname { get; set; }
+        }
+
+        private sealed class Scp106AttackCredit
+        {
+            public string AttackerUserId { get; set; }
+            public string AttackerNickname { get; set; }
+            public DateTime AttackedAtUtc { get; set; }
+            public bool PocketEntryConfirmed { get; set; }
         }
 
         private enum RoleCategory
