@@ -34,6 +34,7 @@ namespace SmokyPluginV2.Discord
         private readonly SemaphoreSlim outboundSignal = new SemaphoreSlim(0);
         private readonly ConcurrentQueue<OutboundMessage> priorityOutbound = new ConcurrentQueue<OutboundMessage>();
         private readonly ConcurrentQueue<OutboundMessage> normalOutbound = new ConcurrentQueue<OutboundMessage>();
+        private readonly ConcurrentDictionary<ulong, byte> pendingGuildMembers = new ConcurrentDictionary<ulong, byte>();
         private readonly object restRateLimitLock = new object();
         private readonly object rateLimitNotificationLock = new object();
         private readonly Dictionary<ulong, DateTime> rateLimitNotificationCooldowns = new Dictionary<ulong, DateTime>();
@@ -81,6 +82,8 @@ namespace SmokyPluginV2.Discord
         public event Action<DiscordMessage> PrefixedMessageReceived;
 
         public event Func<DiscordInteraction, DiscordInteractionResponse> InteractionReceived;
+
+        public event Action<DiscordGuildMemberEvent> GuildMemberAvailable;
 
         public bool IsReady { get; private set; }
 
@@ -465,6 +468,30 @@ namespace SmokyPluginV2.Discord
                 return;
             }
 
+            if (type == "GUILD_MEMBER_ADD" && data != null)
+            {
+                HandleGuildMemberAdd(data);
+                return;
+            }
+
+            if (type == "GUILD_MEMBER_UPDATE" && data != null)
+            {
+                HandleGuildMemberUpdate(data);
+                return;
+            }
+
+            if (type == "GUILD_MEMBER_REMOVE" && data != null)
+            {
+                if (ParseSnowflake(data, "guild_id") != settings.GuildId)
+                    return;
+
+                Dictionary<string, object> removedUser = data.TryGetValue("user", out object removedUserValue)
+                    ? Json.Object(removedUserValue)
+                    : null;
+                pendingGuildMembers.TryRemove(ParseSnowflake(removedUser, "id"), out _);
+                return;
+            }
+
             if (type != "MESSAGE_CREATE" || !settings.ListenForCommands || data is null)
                 return;
 
@@ -506,6 +533,71 @@ namespace SmokyPluginV2.Discord
                 }
             });
         }
+
+        private void HandleGuildMemberAdd(Dictionary<string, object> data)
+        {
+            ulong guildId = ParseSnowflake(data, "guild_id");
+            Dictionary<string, object> user = data.TryGetValue("user", out object userValue)
+                ? Json.Object(userValue)
+                : null;
+            ulong userId = ParseSnowflake(user, "id");
+            if (guildId != settings.GuildId || userId == 0 || IsBotUser(user))
+                return;
+
+            bool pending = data.TryGetValue("pending", out object pendingValue) &&
+                pendingValue != null &&
+                Convert.ToBoolean(pendingValue, CultureInfo.InvariantCulture);
+            if (pending)
+            {
+                pendingGuildMembers[userId] = 0;
+                return;
+            }
+
+            RaiseGuildMemberAvailable(guildId, userId);
+        }
+
+        private void HandleGuildMemberUpdate(Dictionary<string, object> data)
+        {
+            ulong guildId = ParseSnowflake(data, "guild_id");
+            Dictionary<string, object> user = data.TryGetValue("user", out object userValue)
+                ? Json.Object(userValue)
+                : null;
+            ulong userId = ParseSnowflake(user, "id");
+            if (guildId != settings.GuildId || userId == 0 || IsBotUser(user))
+                return;
+
+            if (!data.TryGetValue("pending", out object pendingValue) || pendingValue == null)
+                return;
+
+            bool pending = Convert.ToBoolean(pendingValue, CultureInfo.InvariantCulture);
+            if (!pending && pendingGuildMembers.TryRemove(userId, out _))
+                RaiseGuildMemberAvailable(guildId, userId);
+        }
+
+        private void RaiseGuildMemberAvailable(ulong guildId, ulong userId)
+        {
+            Task.Run(() =>
+            {
+                try
+                {
+                    GuildMemberAvailable?.Invoke(new DiscordGuildMemberEvent
+                    {
+                        GuildId = guildId,
+                        UserId = userId,
+                    });
+                }
+                catch (Exception exception)
+                {
+                    Log.Error($"[Discord] Guild member handler failed: {exception}");
+                }
+            });
+        }
+
+        private static bool IsBotUser(Dictionary<string, object> user) =>
+            user != null &&
+            user.TryGetValue("bot", out object botValue) &&
+            botValue != null &&
+            Convert.ToBoolean(botValue, CultureInfo.InvariantCulture);
 
         private void HandleInteraction(Dictionary<string, object> data)
         {
@@ -794,7 +886,7 @@ namespace SmokyPluginV2.Discord
 
         private async Task IdentifyAsync(CancellationToken token)
         {
-            int intents = 1 | 512;
+            int intents = 1 | 2 | 512;
             if (settings.ListenForCommands)
                 intents |= 32768;
 

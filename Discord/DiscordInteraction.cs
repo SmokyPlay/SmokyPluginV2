@@ -1,5 +1,12 @@
 namespace SmokyPluginV2.Discord
 {
+    internal sealed class DiscordGuildMemberEvent
+    {
+        public ulong GuildId { get; set; }
+
+        public ulong UserId { get; set; }
+    }
+
     internal sealed class DiscordInteraction
     {
         public ulong Id { get; set; }

@@ -92,6 +92,7 @@ namespace SmokyPluginV2.Privileges
 
             HashSet<string> steamPrivilegeGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             HashSet<string> discordPrivilegeGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> managedDiscordGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (!TryResolveSteamPrivileges(
                     identity,
                     currentSettings,
@@ -103,7 +104,11 @@ namespace SmokyPluginV2.Privileges
             {
                 return false;
             }
-            if (!TryResolveDiscordPrivileges(identity, discordPrivilegeGroups, out error))
+            if (!TryResolveDiscordPrivileges(
+                    identity,
+                    discordPrivilegeGroups,
+                    managedDiscordGroups,
+                    out error))
                 return false;
 
             string[] combinedPrivilegeGroups = steamPrivilegeGroups
@@ -117,6 +122,7 @@ namespace SmokyPluginV2.Privileges
                 SteamPrivilegeGroups = steamPrivilegeGroups.ToArray(),
                 DiscordPrivilegeGroups = discordPrivilegeGroups.ToArray(),
                 PrivilegeGroups = combinedPrivilegeGroups,
+                ManagedDiscordGroups = managedDiscordGroups.ToArray(),
                 TotalPlaytimeSeconds = totalPlaytimeSeconds,
                 TemporaryRolePreferenceWeight = temporaryRolePreferenceWeight,
             };
@@ -187,6 +193,7 @@ namespace SmokyPluginV2.Privileges
         private static bool TryResolveDiscordPrivileges(
             ResolvedIdentity identity,
             ISet<string> result,
+            ISet<string> managedResult,
             out string error)
         {
             // Discord-bound donations will be resolved here when that source is implemented.

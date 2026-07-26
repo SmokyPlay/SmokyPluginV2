@@ -15,6 +15,8 @@ namespace SmokyPluginV2.Privileges
 
         public IReadOnlyList<string> PrivilegeGroups { get; set; } = Array.Empty<string>();
 
+        public IReadOnlyList<string> ManagedDiscordGroups { get; set; } = Array.Empty<string>();
+
         public long TotalPlaytimeSeconds { get; set; }
 
         public double? TemporaryRolePreferenceWeight { get; set; }

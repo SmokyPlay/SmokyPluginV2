@@ -17,6 +17,7 @@ namespace SmokyPluginV2.Discord
 
     using SmokyPluginV2.AccountLinks;
     using SmokyPluginV2.Database;
+    using SmokyPluginV2.Privileges;
     using SmokyPluginV2.Referrals;
     using SmokyPluginV2.Statistics;
 
@@ -50,6 +51,7 @@ namespace SmokyPluginV2.Discord
             client = new DiscordBotClient(settings);
             client.PrefixedMessageReceived += OnPrefixedMessageReceived;
             client.InteractionReceived += OnInteractionReceived;
+            client.GuildMemberAvailable += OnGuildMemberAvailable;
         }
 
         public static DiscordLogService Current { get; private set; }
@@ -148,6 +150,7 @@ namespace SmokyPluginV2.Discord
             FlushBufferedLines();
             client.PrefixedMessageReceived -= OnPrefixedMessageReceived;
             client.InteractionReceived -= OnInteractionReceived;
+            client.GuildMemberAvailable -= OnGuildMemberAvailable;
             client.Dispose();
 
             if (ReferenceEquals(Current, this))
@@ -366,6 +369,33 @@ namespace SmokyPluginV2.Discord
             MainThreadDispatcher.Dispatch(
                 () => ExecuteDiscordCommand(message),
                 MainThreadDispatcher.DispatchTime.FixedUpdate);
+        }
+
+        private void OnGuildMemberAvailable(DiscordGuildMemberEvent member)
+        {
+            if (disposed || member == null || member.GuildId != settings.GuildId || member.UserId == 0)
+                return;
+
+            PlayerAccessService access = Plugin.Instance?.PlayerAccess;
+            if (access == null)
+                return;
+
+            _ = SynchronizeGuildMemberRolesAsync(access, member.UserId);
+        }
+
+        private static async Task SynchronizeGuildMemberRolesAsync(
+            PlayerAccessService access,
+            ulong discordUserId)
+        {
+            try
+            {
+                await access.SynchronizeDiscordRolesByDiscordIdAsync(discordUserId).ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                Log.Error(
+                    $"[Discord] Failed to synchronize returning guild member {discordUserId}: {exception}");
+            }
         }
 
         private DiscordInteractionResponse OnInteractionReceived(DiscordInteraction interaction)

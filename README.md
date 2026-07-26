@@ -69,13 +69,14 @@ Create a MariaDB 11.4 database and user before starting the plugin. The user nee
 ## Discord application setup
 
 1. Create an application and bot at <https://discord.com/developers/applications>.
-2. On the **Bot** page, enable **Message Content Intent**. It is needed because `listen_for_commands` is enabled by default.
+2. On the **Bot** page, enable **Server Members Intent** so returning guild members can have their linked privilege roles restored. Enable **Message Content Intent** as well when `listen_for_commands` is enabled.
 3. Invite the bot to your Discord server with the `bot` scope. The `applications.commands` scope is included automatically with bot installations.
 4. Give it these permissions in all configured log channels:
    - View Channel
    - Send Messages
    - Embed Links
-5. Never publish the token or send it in screenshots/logs.
+5. Give the bot **Manage Roles** at guild level and place its highest role above every role configured for linking or privilege synchronization.
+6. Never publish the token or send it in screenshots/logs.
 
 Leave **Interactions Endpoint URL** empty in the Developer Portal. Slash-command interactions are received through the bot's existing Gateway connection, so no public HTTP server is required.
 
@@ -285,9 +286,11 @@ Codes are generated with `RandomNumberGenerator`, are bound to the Discord user 
 
 On every player verification the plugin resolves Steam-bound privileges and, when linked, Discord-bound privileges separately, combines them, reconciles managed Discord roles with one member lookup, and assigns the highest matching `role_groups` entry in the game. `earned_privileges.group_name` is active after either `earned_privileges.required_hours` or the configured number of qualified referrals; no computed privilege is stored in another table. After `reload remoteadmin`, the same live synchronization is repeated for every linked online player. With `preserve_native_group: true`, a Steam UserId explicitly present in `config_remoteadmin.txt` keeps the game's native group, while managed Discord roles are still reconciled.
 
+When a user joins the configured Discord guild, `GUILD_MEMBER_ADD` starts a Discord-only privilege synchronization. It restores the link role and all active Steam- and Discord-bound privilege roles without touching the player's current in-game group. Members waiting for Discord Membership Screening are synchronized after their `pending` state clears.
+
 A referral code is permanent and is generated lazily by `/referral` for a linked account. Each player can accept one code with `.ref CODE` before `code_entry_max_minutes`; the number of players using an inviter's code is unlimited. Qualification is derived from aggregate playtime in `player_statistics`; no qualified flag or duplicate playtime is stored. Pending invitees receive `pending_referral_weight`, while the inviter receives the earned group after `required_referrals` invitees each reach `qualification_minutes`.
 
-On unlink, the old Discord ID is retained only for the cleanup pass. The dedicated link role is removed, but existing privilege roles are preserved because Discord roles may have been granted manually. An online game player is recalculated using only Steam-bound privileges because the Discord account is no longer linked. The two source lists are deliberately not combined after the link has been deleted.
+On unlink, the old Discord ID is retained for the cleanup pass. The dedicated link role and every currently active Steam-bound privilege role are removed from that Discord account; Discord-bound and unrelated roles remain untouched. The same Steam privilege snapshot is reused to recalculate an online game player after the Discord account is no longer linked.
 
 ## Warning commands
 
