@@ -20,6 +20,7 @@ namespace SmokyPluginV2.Discord
     using SmokyPluginV2.Privileges;
     using SmokyPluginV2.Referrals;
     using SmokyPluginV2.Statistics;
+    using SmokyPluginV2.Moderation;
 
     internal sealed class DiscordLogService : IDisposable
     {
@@ -34,11 +35,18 @@ namespace SmokyPluginV2.Discord
         internal const int ModerationColor = 0xE67E22;
         internal const int PunishmentColor = 0xE74C3C;
 
+        private static readonly IReadOnlyDictionary<string, string> SlashCommandPermissions =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["punishments"] = ModerationPermissions.ViewHistory,
+            };
+
         private readonly DiscordSettings settings;
         private readonly DiscordBotClient client;
         private readonly ConcurrentQueue<string> gameLines = new ConcurrentQueue<string>();
         private readonly ConcurrentQueue<string> remoteAdminLines = new ConcurrentQueue<string>();
         private readonly ConcurrentDictionary<string, string> synchronizedGroups = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, PunishmentSession> punishmentSessions = new ConcurrentDictionary<string, PunishmentSession>(StringComparer.Ordinal);
         private readonly object gameFlushLock = new object();
         private readonly object remoteAdminFlushLock = new object();
         private Timer statusTimer;
@@ -119,6 +127,27 @@ namespace SmokyPluginV2.Discord
 
             client.QueueEmbed(settings.ModerationChannelId, title, description, isPunishment ? PunishmentColor : ModerationColor);
             return true;
+        }
+
+        public Task<bool> SendWarningDirectMessageAsync(
+            ulong discordUserId,
+            string serverName,
+            string reason,
+            DateTime issuedAtUtc)
+        {
+            if (disposed || discordUserId == 0)
+                return Task.FromResult(false);
+
+            long issued = new DateTimeOffset(issuedAtUtc).ToUnixTimeSeconds();
+            string description =
+                $"На сервере **{Escape(serverName)}** вам было выдано предупреждение.\n\n" +
+                $"**Причина:**\n{Escape(reason)}\n\n" +
+                $"**Выдано:** <t:{issued}:F> • <t:{issued}:R>";
+            return client.SendDirectEmbedAsync(
+                discordUserId,
+                "⚠️ Вы получили предупреждение",
+                description,
+                ModerationColor);
         }
 
         public void UpdatePresence(int? knownPlayerCount = null)
@@ -380,16 +409,24 @@ namespace SmokyPluginV2.Discord
             if (access == null)
                 return;
 
-            _ = SynchronizeGuildMemberRolesAsync(access, member.UserId);
+            _ = SynchronizeGuildMemberRolesAsync(access, member.UserId, member.RoleIds);
         }
 
         private static async Task SynchronizeGuildMemberRolesAsync(
             PlayerAccessService access,
-            ulong discordUserId)
+            ulong discordUserId,
+            ulong[] roleIds)
         {
             try
             {
-                await access.SynchronizeDiscordRolesByDiscordIdAsync(discordUserId).ConfigureAwait(false);
+                await access.SynchronizeDiscordRolesByDiscordIdAsync(
+                    discordUserId,
+                    new DiscordGuildMemberResult
+                    {
+                        IsSuccess = true,
+                        IsGuildMember = true,
+                        RoleIds = roleIds ?? Array.Empty<ulong>(),
+                    }).ConfigureAwait(false);
             }
             catch (Exception exception)
             {
@@ -406,8 +443,16 @@ namespace SmokyPluginV2.Discord
             if (interaction is null || interaction.GuildId != settings.GuildId || interaction.UserId == 0)
                 return Ephemeral("Команда доступна только участникам настроенного Discord-сервера.");
 
+            if (interaction.IsComponent && (interaction.CustomId ?? string.Empty).StartsWith("punishments:", StringComparison.Ordinal))
+                return HandlePunishmentComponent(interaction);
+
             string commandName = (interaction.CommandName ?? string.Empty).ToLowerInvariant();
-            MariaDbService database = Plugin.Instance?.Database;
+            if (SlashCommandPermissions.TryGetValue(commandName, out string requiredPermission) &&
+                !HasSlashPermission(interaction, requiredPermission, out string slashPermissionError))
+                return Ephemeral(slashPermissionError);
+            PostgreSqlService database = Plugin.Instance?.Database;
+            if (commandName == "punishments")
+                return HandlePunishments(interaction, database);
             if (commandName == "server-stats")
             {
                 if (database == null || Plugin.Instance?.Config?.Statistics?.IsEnabled != true)
@@ -487,8 +532,8 @@ namespace SmokyPluginV2.Discord
                     return Ephemeral("❌ " + requesterError);
                 bool isOwner = !string.IsNullOrWhiteSpace(requesterUserId) &&
                     string.Equals(
-                        MariaDbService.NormalizeSteamId(requesterUserId),
-                        MariaDbService.NormalizeSteamId(statsUserId),
+                        PostgreSqlService.NormalizeSteamId(requesterUserId),
+                        PostgreSqlService.NormalizeSteamId(statsUserId),
                         StringComparison.Ordinal);
                 if (playerStats.StatisticsPrivate && !isOwner)
                     return Ephemeral("Этот игрок закрыл доступ к своей статистике.");
@@ -706,6 +751,168 @@ namespace SmokyPluginV2.Discord
 
             if (notifyPlayer)
                 player.SendConsoleMessage($"Discord-роли синхронизированы. Назначена группа Remote Admin: {groupName}.", "green");
+        }
+
+        private DiscordInteractionResponse HandlePunishments(DiscordInteraction interaction, PostgreSqlService database)
+        {
+            PunishmentService service = Plugin.Instance?.Punishments;
+            if (service == null || database == null) return Ephemeral("Система наказаний сейчас недоступна.");
+            bool hasDiscord = interaction.TargetDiscordUserId != 0;
+            bool hasSteam = !string.IsNullOrWhiteSpace(interaction.SteamId);
+            if (hasDiscord && hasSteam) return Ephemeral("Укажите либо Discord-аккаунт, либо SteamID64.");
+            string userId;
+            if (hasSteam)
+            {
+                string steamId = interaction.SteamId.Trim();
+                if (!PostgreSqlService.IsSteamUserId(steamId)) return Ephemeral("SteamID64 должен состоять ровно из 17 цифр.");
+                userId = PostgreSqlService.ToExiledUserId(steamId);
+            }
+            else
+            {
+                ulong discordId = hasDiscord ? interaction.TargetDiscordUserId : interaction.UserId;
+                if (!database.TryGetPlayerUserId(discordId, out userId, out string error)) return Ephemeral("❌ " + error);
+                if (string.IsNullOrWhiteSpace(userId)) return Ephemeral("К этому Discord-аккаунту не привязан SteamID64.");
+            }
+            foreach (KeyValuePair<string, PunishmentSession> pair in punishmentSessions)
+                if (pair.Value.ExpiresAtUtc <= DateTime.UtcNow) punishmentSessions.TryRemove(pair.Key, out _);
+            string sessionId = Guid.NewGuid().ToString("N");
+            punishmentSessions[sessionId] = new PunishmentSession { OwnerId = interaction.UserId, PlayerUserId = userId, ExpiresAtUtc = DateTime.UtcNow.AddMinutes(10) };
+            return BuildPunishmentPage(service, sessionId, userId, 0, false);
+        }
+
+        private DiscordInteractionResponse HandlePunishmentComponent(DiscordInteraction interaction)
+        {
+            string[] parts = (interaction.CustomId ?? string.Empty).Split(':');
+            if (parts.Length != 3 || !int.TryParse(parts[2], out int page) || !punishmentSessions.TryGetValue(parts[1], out PunishmentSession session))
+                return Ephemeral("Эта страница истории больше недоступна. Выполните `/punishments` ещё раз.");
+            if (session.OwnerId != interaction.UserId) return Ephemeral("Этими кнопками может пользоваться только автор команды.");
+            if (session.ExpiresAtUtc <= DateTime.UtcNow)
+            { punishmentSessions.TryRemove(parts[1], out _); return Ephemeral("Срок действия этой страницы истёк. Выполните `/punishments` ещё раз."); }
+            if (!HasSlashPermission(interaction, ModerationPermissions.ViewHistory, out string error)) return Ephemeral(error);
+            return BuildPunishmentPage(Plugin.Instance?.Punishments, parts[1], session.PlayerUserId, Math.Max(0, page), true);
+        }
+
+        private DiscordInteractionResponse BuildPunishmentPage(PunishmentService service, string sessionId, string userId, int requestedPage, bool update)
+        {
+            if (service == null) return Ephemeral("❌ История недоступна.");
+            if (!service.TryGetHistory(userId, out PunishmentHistory history, out string error)) return Ephemeral("❌ " + (error ?? "История недоступна."));
+            if (!history.PlayerExists) return Ephemeral("Игрок с указанным SteamID64 не найден.");
+            const int perPage = 5;
+            int pages = Math.Max(1, (history.Records.Count + perPage - 1) / perPage);
+            int page = Math.Min(requestedPage, pages - 1);
+            PunishmentRecord[] records = history.Records.Skip(page * perPage).Take(perPage).ToArray();
+            string nickname = string.IsNullOrWhiteSpace(history.PlayerNickname) ? "Неизвестный игрок" : history.PlayerNickname;
+            string linkedDiscord = history.DiscordUserId == 0 ? "не привязан" : $"<@{history.DiscordUserId}>";
+            DiscordEmbedField[] fields = records.Length == 0
+                ? new[] { new DiscordEmbedField { Name = "История пуста", Value = "У игрока пока нет записанных наказаний.", Inline = false } }
+                : records.Select(FormatPunishmentField).ToArray();
+            string status = FormatPunishmentStatus(history.Records);
+            DiscordEmbed embed = new DiscordEmbed
+            {
+                Title = $"История наказаний — {nickname}",
+                Description = $"**SteamID:** `{PostgreSqlService.NormalizeSteamId(history.PlayerUserId)}`\n**Discord:** {linkedDiscord}\n**Всего записей:** {history.Records.Count}\n\n{status}",
+                Color = PunishmentColor,
+                Fields = fields,
+                Footer = $"Страница {page + 1} из {pages}",
+            };
+            DiscordActionRow[] components = pages <= 1 ? Array.Empty<DiscordActionRow>() : new[]
+            {
+                new DiscordActionRow { Buttons = new[]
+                {
+                    new DiscordButton { CustomId = $"punishments:{sessionId}:{page - 1}", Label = "◀", Disabled = page == 0 },
+                    new DiscordButton { CustomId = $"punishments:{sessionId}:{page}", Label = $"{page + 1} / {pages}", Disabled = true },
+                    new DiscordButton { CustomId = $"punishments:{sessionId}:{page + 1}", Label = "▶", Disabled = page + 1 >= pages },
+                } },
+            };
+            return new DiscordInteractionResponse { Embed = embed, Components = components, Ephemeral = false, UpdateMessage = update };
+        }
+
+        private static DiscordEmbedField FormatPunishmentField(PunishmentRecord record)
+        {
+            long issued = new DateTimeOffset(record.IssuedAtUtc).ToUnixTimeSeconds();
+            string icon = record.Type == PunishmentType.Warning ? "⚠️" : record.Type == PunishmentType.Kick ? "🚪" : "🔨";
+            string value = $"**Причина:** {Escape(record.Reason)}\n**Выдано:** <t:{issued}:F> • <t:{issued}:R>\n**Модератор:** {FormatModerator(record)}";
+            if (record.Type == PunishmentType.Ban)
+            {
+                if (record.ExpiresAtUtc.HasValue)
+                {
+                    long expires = new DateTimeOffset(record.ExpiresAtUtc.Value).ToUnixTimeSeconds();
+                    string status = record.ExpiresAtUtc.Value > DateTime.UtcNow ? "активен" : "истёк";
+                    value += $"\n**Длительность:** {FormatPunishmentDuration(record.ExpiresAtUtc.Value - record.IssuedAtUtc)}\n**Истекает:** <t:{expires}:F> • <t:{expires}:R>\n**Статус:** {status}";
+                }
+                else value += "\n**Срок:** бессрочно\n**Статус:** активен";
+            }
+            return new DiscordEmbedField { Name = $"{icon} #{record.Id} • {Commands.ModerationCommandHelpers.TypeName(record.Type)}", Value = value, Inline = false };
+        }
+
+        private static string FormatModerator(PunishmentRecord record)
+        {
+            string id = record.ModeratorUserId;
+            if (string.Equals(id, "server", StringComparison.OrdinalIgnoreCase)) return "Dedicated Server";
+            if (!string.IsNullOrWhiteSpace(record.ModeratorSteamId))
+            {
+                string nickname = string.IsNullOrWhiteSpace(record.ModeratorNickname) ? "Неизвестный модератор" : Escape(record.ModeratorNickname);
+                return $"**{nickname}** (`{Escape(record.ModeratorSteamId)}`)";
+            }
+            if (!string.IsNullOrWhiteSpace(id) && id.EndsWith("@discord", StringComparison.OrdinalIgnoreCase)) return $"<@{id.Substring(0, id.Length - 8)}>";
+            return $"`{Escape(id)}`";
+        }
+
+        private static string FormatPunishmentStatus(IReadOnlyList<PunishmentRecord> records)
+        {
+            if (records.Count == 0) return "**Без наказаний:** нарушений не зафиксировано";
+            PunishmentRecord permanent = records.FirstOrDefault(item => item.Type == PunishmentType.Ban && !item.ExpiresAtUtc.HasValue);
+            if (permanent != null) return $"**Активный бан:** #{permanent.Id}\n**Срок:** бессрочно";
+            PunishmentRecord latest = records.OrderByDescending(item => item.EffectiveEndUtc.Value).First();
+            DateTime end = latest.EffectiveEndUtc.Value;
+            long timestamp = new DateTimeOffset(end).ToUnixTimeSeconds();
+            if (end > DateTime.UtcNow)
+                return $"**Активный бан:** #{latest.Id}\n**Истекает:** <t:{timestamp}:F> • <t:{timestamp}:R>";
+            return $"**Без наказаний:** {FormatElapsed(DateTime.UtcNow - end)}\n**Отсчёт от:** {Commands.ModerationCommandHelpers.TypeName(latest.Type).ToLowerInvariant()} #{latest.Id} • <t:{timestamp}:R>";
+        }
+
+        private static string FormatElapsed(TimeSpan value)
+        {
+            if (value.TotalDays >= 1) return FormatRussianCount((int)value.TotalDays, "день", "дня", "дней");
+            if (value.TotalHours >= 1) return FormatRussianCount((int)value.TotalHours, "час", "часа", "часов");
+            if (value.TotalMinutes >= 1) return FormatRussianCount((int)value.TotalMinutes, "минута", "минуты", "минут");
+            return "меньше минуты";
+        }
+
+        private static string FormatRussianCount(int value, string one, string few, string many)
+        {
+            int lastTwo = value % 100;
+            int last = value % 10;
+            string word = lastTwo >= 11 && lastTwo <= 14 ? many : last == 1 ? one : last >= 2 && last <= 4 ? few : many;
+            return $"{value} {word}";
+        }
+
+        private static string FormatPunishmentDuration(TimeSpan value)
+        {
+            if (value.TotalDays >= 1) return $"{value.TotalDays:0.##} дн.";
+            if (value.TotalHours >= 1) return $"{value.TotalHours:0.##} ч.";
+            if (value.TotalMinutes >= 1) return $"{value.TotalMinutes:0.##} мин.";
+            return $"{Math.Max(0, value.TotalSeconds):0} сек.";
+        }
+
+        private bool HasSlashPermission(DiscordInteraction interaction, string permission, out string error)
+        {
+            if (!TrySelectRoleGroup(interaction.RoleIds, out DiscordRoleGroupMapping mapping))
+            { error = "У вас нет Discord-роли, связанной с группой Remote Admin."; return false; }
+            string groupName = mapping.RemoteAdminGroup.Trim();
+            if (Server.PermissionsHandler == null || !Server.PermissionsHandler.Groups.TryGetValue(groupName, out UserGroup group))
+            { error = $"Группа Remote Admin `{groupName}` не найдена на сервере."; return false; }
+            DiscordCommandSender sender = new DiscordCommandSender(interaction.UserId, interaction.UserId.ToString(), groupName, group, null);
+            if (!sender.CheckExiledPermission(permission))
+            { error = $"Недостаточно прав. Требуется: `{permission}`"; return false; }
+            error = null; return true;
+        }
+
+        private sealed class PunishmentSession
+        {
+            public ulong OwnerId { get; set; }
+            public string PlayerUserId { get; set; }
+            public DateTime ExpiresAtUtc { get; set; }
         }
 
         private static DiscordInteractionResponse Ephemeral(string content) => new DiscordInteractionResponse

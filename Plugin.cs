@@ -14,6 +14,7 @@ namespace SmokyPluginV2
     using SmokyPluginV2.Referrals;
     using SmokyPluginV2.RolePreferences;
     using SmokyPluginV2.Statistics;
+    using SmokyPluginV2.Moderation;
 
     using UnityEngine;
 
@@ -29,7 +30,7 @@ namespace SmokyPluginV2
         private Handlers.GeneralBroadcastHandler generalBroadcastHandler;
         private RolePreferenceService rolePreferenceService;
         private AccountLinkService accountLinkService;
-        private MariaDbService databaseService;
+        private PostgreSqlService databaseService;
         private StatisticsService statisticsService;
         private Handlers.DiscordGameEventHandler discordGameEventHandler;
         private Handlers.DiscordModerationHandler discordModerationHandler;
@@ -39,18 +40,21 @@ namespace SmokyPluginV2
         private PlayerAccessService playerAccessService;
         private ReferralService referralService;
         private Harmony harmony;
-        private Warnings.WarningService warningService;
+        private PunishmentService punishmentService;
+        private WarningNotificationService warningNotificationService;
 
         /// <summary>
         /// Gets the currently loaded plugin instance.
         /// </summary>
         public static Plugin Instance { get; private set; }
 
-        internal Warnings.WarningService WarningService => warningService;
+        internal PunishmentService Punishments => punishmentService;
+
+        internal WarningNotificationService WarningNotifications => warningNotificationService;
 
         internal AccountLinkService AccountLinks => accountLinkService;
 
-        internal MariaDbService Database => databaseService;
+        internal PostgreSqlService Database => databaseService;
 
         internal StatisticsService Statistics => statisticsService;
 
@@ -78,7 +82,7 @@ namespace SmokyPluginV2
         public override string Author => "Smoky";
 
         /// <inheritdoc />
-        public override Version Version => new(0, 20, 0);
+        public override Version Version => new(0, 23, 1);
 
         /// <inheritdoc />
         public override Version RequiredExiledVersion => new(9, 14, 2);
@@ -93,14 +97,14 @@ namespace SmokyPluginV2
                 try
                 {
                     SharedDatabaseSettings sharedDatabaseSettings = SharedDatabaseConfig.Load();
-                    databaseService = new MariaDbService(sharedDatabaseSettings, Config.Database.ServerName);
+                    databaseService = new PostgreSqlService(sharedDatabaseSettings, Config.Database.ServerName);
                     referralService = new ReferralService(
                         databaseService,
                         Config.EarnedPrivileges?.Referrals);
                     referralService.Register();
                     bool importLegacyYaml = Config.Database.ImportLegacyYaml;
                     if (Config.Warnings?.IsEnabled == true)
-                        warningService = new Warnings.WarningService(databaseService, importLegacyYaml);
+                        punishmentService = new PunishmentService(databaseService, importLegacyYaml);
                     if (Config.Discord?.AccountLinking?.IsEnabled == true)
                         accountLinkService = new AccountLinkService(databaseService, importLegacyYaml);
                     if (Config.Statistics?.IsEnabled == true)
@@ -111,11 +115,11 @@ namespace SmokyPluginV2
                 }
                 catch (Exception exception)
                 {
-                    Log.Error($"[Database] MariaDB initialization failed. Statistics, warnings and account links are unavailable; other plugin features will continue:\n{exception}");
+                    Log.Error($"[Database] PostgreSQL initialization failed. Statistics, warnings and account links are unavailable; other plugin features will continue:\n{exception}");
                     statisticsService?.Dispose();
                     statisticsService = null;
-                    warningService?.Dispose();
-                    warningService = null;
+                    punishmentService?.Dispose();
+                    punishmentService = null;
                     accountLinkService?.Dispose();
                     accountLinkService = null;
                     referralService?.Dispose();
@@ -126,7 +130,7 @@ namespace SmokyPluginV2
             }
             else if (Config.Statistics?.IsEnabled == true || Config.Warnings?.IsEnabled == true || Config.Discord?.AccountLinking?.IsEnabled == true)
             {
-                Log.Warn("[Database] MariaDB is disabled. Statistics, warnings and account links will not be started.");
+                Log.Warn("[Database] PostgreSQL is disabled. Statistics, warnings and account links will not be started.");
             }
 
             emptyRoundHandler = new Handlers.EmptyRoundHandler();
@@ -202,10 +206,19 @@ namespace SmokyPluginV2
                     discordGameEventHandler = new Handlers.DiscordGameEventHandler();
                     discordGameEventHandler.Register();
 
-                    discordModerationHandler = new Handlers.DiscordModerationHandler();
-                    discordModerationHandler.Register();
-
                 }
+            }
+
+            if (punishmentService != null || discordLogService != null)
+            {
+                discordModerationHandler = new Handlers.DiscordModerationHandler(punishmentService);
+                discordModerationHandler.Register();
+            }
+
+            if (punishmentService != null)
+            {
+                warningNotificationService = new WarningNotificationService(punishmentService);
+                warningNotificationService.Register();
             }
 
             if (databaseService != null)
@@ -229,6 +242,9 @@ namespace SmokyPluginV2
         /// <inheritdoc />
         public override void OnDisabled()
         {
+            warningNotificationService?.Unregister();
+            warningNotificationService = null;
+
             statisticsService?.Dispose();
             statisticsService = null;
 
@@ -239,8 +255,8 @@ namespace SmokyPluginV2
             referralService?.Dispose();
             referralService = null;
 
-            warningService?.Dispose();
-            warningService = null;
+            punishmentService?.Dispose();
+            punishmentService = null;
 
             discordGameEventHandler?.Unregister();
             discordGameEventHandler = null;
@@ -330,6 +346,14 @@ namespace SmokyPluginV2
 
         internal void ApplyReloadedConfiguration()
         {
+            if (databaseService != null)
+            {
+                if (databaseService.TryUpdateServerName(Config?.Database?.ServerName, out string error))
+                    Log.Info($"[Database] Server display name reloaded: {databaseService.ServerName}.");
+                else
+                    Log.Error($"[Database] Could not reload the server display name: {error}");
+            }
+
             ReloadRolePreferenceConfiguration();
             discordLogService?.ReloadRoleGroupMappings(Config?.Discord);
             referralService?.ReloadSettings(Config?.EarnedPrivileges?.Referrals);

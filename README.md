@@ -2,11 +2,12 @@
 
 EXILED 9.14.2 plugin for SCP: Secret Laboratory 14.2.7.
 
-Version 0.20.0 stores player statistics, server statistics, account links, referrals and warnings in MariaDB. Multiple SCP:SL instances share one database configuration and are separated automatically by their game ports.
+Version 0.23.1 stores player statistics, server statistics, account links, referrals and moderation history in PostgreSQL. Multiple SCP:SL instances share one database configuration and are separated automatically by their game ports.
 
 ## Current features
 
-- Persistent warnings and one-to-one Steam/Discord links stored in MariaDB.
+- Persistent warning, kick and ban history and one-to-one Steam/Discord links stored in PostgreSQL.
+- Offline warnings are delivered by Discord DM when an account link is available; otherwise they remain pending and are queued as broadcasts when the player next joins the issuing server.
 - Compact aggregate player statistics, keyed by server and Steam ID; no per-round history rows are retained.
 - Aggregate server statistics, including round outcomes, round duration, warhead detonations and separate MTF/Chaos main and reinforcement waves.
 - Discord `/stats` and `/server-stats` embeds, with global per-player privacy controlled by `/stats-privacy`.
@@ -14,11 +15,10 @@ Version 0.20.0 stores player statistics, server statistics, account links, refer
 - `statstoggle` (aliases: `togglestats`, `ts`) temporarily pauses statistics for the current round and requires its own EXILED permission.
 - `clearstats <game ID|SteamID64>` (aliases: `resetstats`, `cs`) clears one player's statistics only for the current server and requires `smokyplugin.statistics.clear`.
 - Statistics are recorded only between `RoundStarted` and `RoundEnded`; lobby and post-round friendly-fire events are never counted. A pause is always reset by the next `RoundStarted`.
-- Remote Admin commands: `warn`, `warnings`/`warns`, and `delwarn`/`unwarn`/`rmwarn`.
+- Remote Admin commands: `warn`, `punishments`/`punishmenthistory`/`ph`, and `delpunishment`/`delpunish`/`dp`.
 - Player console command `.warns` to view personal warnings without moderator information.
-- One `smokyplugin.warnings` Exiled.Permissions node controls all administrative warning commands.
-- Warning creation and deletion enforce the Remote Admin hierarchy without exposing its numeric values in responses or logs.
-- The YAML file is checked before every warning operation, so valid manual edits are visible without restarting the server.
+- Separate EXILED permissions control warning issue, history view and history deletion.
+- Discord `/punishments` provides a public, paginated moderation-history embed and rechecks the mapped RA group permission on every button interaction.
 - Immediate active-round restart after the last player leaves.
 - Friendly fire enabled only during the post-round period and forcibly disabled before the next round.
 - First-time late joiners can spawn as Class D, Facility Guard or Scientist during a configurable opening window; reconnecting participants cannot spawn again.
@@ -58,13 +58,20 @@ For port `25566`, for example:
 ~/.config/EXILED/Plugins/25566
 ```
 
-Copy `bin/Release/MySqlConnector.dll` to EXILED's shared dependency directory:
+Copy `bin/Release/Npgsql.dll` and these nine companion files to EXILED's shared dependency directory:
 
 ```text
-~/.config/EXILED/Plugins/dependencies/MySqlConnector.dll
+~/.config/EXILED/Plugins/dependencies/
 ```
 
-Create a MariaDB 11.4 database and user before starting the plugin. The user needs permission to create and alter tables and to read/write rows in that database. The plugin creates its schema automatically; it does not create the database itself.
+The required files are `Microsoft.Bcl.AsyncInterfaces.dll`, `System.Buffers.dll`,
+`System.Memory.dll`, `System.Numerics.Vectors.dll`,
+`System.Runtime.CompilerServices.Unsafe.dll`, `System.Text.Encodings.Web.dll`,
+`System.Text.Json.dll`, `System.Threading.Tasks.Extensions.dll` and
+`System.ValueTuple.dll`. They are shared by all game-server instances and are
+not embedded in `SmokyPluginV2.dll`.
+
+Create a PostgreSQL 18 database and user before starting the plugin. The user needs permission to create and alter tables and to read/write rows in that database. The plugin creates its schema automatically; it does not create the database itself. For an existing MariaDB installation, follow [the dump migration guide](migration/README.md) before starting version 0.21.2.
 
 ## Discord application setup
 
@@ -82,17 +89,17 @@ Leave **Interactions Endpoint URL** empty in the Developer Portal. Slash-command
 
 ## EXILED configuration
 
-Start one server once with version 0.18.1. The plugin creates the shared database file at:
+Start one server once with version 0.21.2. The plugin creates the shared database file at:
 
 ```text
 ~/.config/EXILED/Configs/Plugins/smoky_plugin_v2/database.yml
 ```
 
-Stop the server and fill in the shared MariaDB credentials:
+Stop the server and fill in the shared PostgreSQL credentials:
 
 ```yaml
 host: "127.0.0.1"
-port: 3306
+port: 5432
 name: "smoky_plugin_v2"
 username: "smoky_plugin_v2"
 password: "CHANGE_ME"
@@ -269,7 +276,7 @@ The bot responds privately with a one-time game-console command:
 .link ABCDE-FGHIJ
 ```
 
-After the verified player enters it, the plugin stores the Steam ID ↔ Discord User ID link in MariaDB and starts the common privilege synchronization. `linked_discord_role_id`, when non-zero, is granted while the link exists. It does not need a `role_groups` entry; if one is added, the same role can also select an RA group.
+After the verified player enters it, the plugin stores the Steam ID ↔ Discord User ID link in PostgreSQL and starts the common privilege synchronization. `linked_discord_role_id`, when non-zero, is granted while the link exists. It does not need a `role_groups` entry; if one is added, the same role can also select an RA group.
 
 Other account commands:
 
@@ -284,27 +291,29 @@ Other account commands:
 
 Codes are generated with `RandomNumberGenerator`, are bound to the Discord user who requested them, expire after `code_lifetime_minutes`, and are consumed once. Links are one-to-one: a Steam account and a Discord account can each appear only once.
 
-On every player verification the plugin resolves Steam-bound privileges and, when linked, Discord-bound privileges separately, combines them, reconciles managed Discord roles with one member lookup, and assigns the highest matching `role_groups` entry in the game. `earned_privileges.group_name` is active after either `earned_privileges.required_hours` or the configured number of qualified referrals; no computed privilege is stored in another table. After `reload remoteadmin`, the same live synchronization is repeated for every linked online player. With `preserve_native_group: true`, a Steam UserId explicitly present in `config_remoteadmin.txt` keeps the game's native group, while managed Discord roles are still reconciled.
+On every player verification the plugin resolves the Steam/Discord identity first, then fetches the Discord member and resolves PostgreSQL privilege sources in parallel. The member is fetched at most once and the resulting role snapshot is passed into reconciliation. Active Steam- and Discord-bound privileges are combined, missing roles are queued for assignment, and the highest matching `role_groups` entry is applied in the game without waiting for the role operations to finish. `earned_privileges.group_name` is active after either `earned_privileges.required_hours` or the configured number of qualified referrals; no computed privilege is stored in another table. After `reload remoteadmin`, the same live synchronization is repeated for every linked online player. With `preserve_native_group: true`, a Steam UserId explicitly present in `config_remoteadmin.txt` keeps the game's native group, while managed Discord roles are still reconciled.
 
-When a user joins the configured Discord guild, `GUILD_MEMBER_ADD` starts a Discord-only privilege synchronization. It restores the link role and all active Steam- and Discord-bound privilege roles without touching the player's current in-game group. Members waiting for Discord Membership Screening are synchronized after their `pending` state clears.
+Discord reconciliation returns a per-role report distinguishing successful changes, already satisfied state, roles preserved by another active privilege, failures, and cancellation. Privilege sources can attach their persistent source IDs to pending revocations; only a successfully settled removal is passed to the PostgreSQL finalization hook. The current playtime/referral privilege never requests removal, so a manually assigned matching Discord role remains untouched during normal synchronization.
+
+When a user joins the configured Discord guild, `GUILD_MEMBER_ADD` starts a Discord-only privilege synchronization. The complete role list from the Gateway member event is reused instead of issuing another REST lookup. It restores the link role and all active Steam- and Discord-bound privilege roles without touching the player's current in-game group. Members waiting for Discord Membership Screening are synchronized after their `pending` state clears.
 
 A referral code is permanent and is generated lazily by `/referral` for a linked account. Each player can accept one code with `.ref CODE` before `code_entry_max_minutes`; the number of players using an inviter's code is unlimited. Qualification is derived from aggregate playtime in `player_statistics`; no qualified flag or duplicate playtime is stored. Pending invitees receive `pending_referral_weight`, while the inviter receives the earned group after `required_referrals` invitees each reach `qualification_minutes`.
 
 On unlink, the old Discord ID is retained for the cleanup pass. The dedicated link role and every currently active Steam-bound privilege role are removed from that Discord account; Discord-bound and unrelated roles remain untouched. The same Steam privilege snapshot is reused to recalculate an online game player after the Discord account is no longer linked.
 
-## Warning commands
+## Moderation history commands
 
-The warning target must be online when `warn` is executed so the plugin can verify the Remote Admin hierarchy. The dedicated server console bypasses this comparison.
+`warn` accepts an online selector or an exact offline SteamID64. Native RA hierarchy is checked in both cases. The dedicated server console bypasses this comparison.
 
 ```text
-warn <player ID, UserId, or nickname> <reason>
-warnings <player or UserId>
-delwarn <warning ID>
+warn <player ID, UserId, nickname, or SteamID64> <reason>
+punishments <player or SteamID64>
+delpunishment <punishment ID>
 ```
 
 Player IDs selected through the Remote Admin interface are accepted both as `2` and in the standard dotted form `2.`.
 
-`warnings` also has the `warns` alias. `delwarn` has the `unwarn` and `rmwarn` aliases. Deleting a warning physically removes its MariaDB row; there is no active/inactive status or retained warning history. Warning IDs are local to each game port. Every successful change is immediately stored and mirrored to the Discord moderation channel when the bot is enabled.
+`punishments` has the `punishmenthistory` and `ph` aliases. `delpunishment` has the `delpunish` and `dp` aliases. IDs are global sequential PostgreSQL identity values. The delete command physically removes only the selected history row. A successful native RA unban by SteamID64 removes matching active ban rows automatically; expired bans remain in history.
 
 Players can open the in-game console and use:
 
@@ -314,10 +323,12 @@ Players can open the in-game console and use:
 
 This displays only their own warning IDs, issue times, and reasons. Moderator identities are never included in this response.
 
-Add this permission node to the matching Remote Admin groups in the Exiled.Permissions configuration:
+Add the required permission nodes to matching groups in the Exiled.Permissions configuration:
 
 ```text
-smokyplugin.warnings
+smokyplugin.moderation.warning.issue
+smokyplugin.moderation.history.view
+smokyplugin.moderation.history.delete
 ```
 
 For example:
@@ -326,12 +337,14 @@ For example:
 moderator:
   inheritance: []
   permissions:
-    - smokyplugin.warnings
+    - smokyplugin.moderation.warning.issue
+    - smokyplugin.moderation.history.view
+    - smokyplugin.moderation.history.delete
     - smokyplugin.statistics.toggle
     - smokyplugin.statistics.clear
 ```
 
-The group name must also exist in `config_remoteadmin`. The `warn` and `delwarn` commands require `smokyplugin.warnings` and must pass the Remote Admin hierarchy check. Numeric hierarchy values are not displayed. The dedicated server console bypasses Exiled.Permissions normally.
+The group name must also exist in `config_remoteadmin`. Exiled.Permissions inheritance and wildcard permissions are honored. Numeric hierarchy values are not displayed. The dedicated server console bypasses Exiled.Permissions normally.
 
 Discord Developer Mode can be enabled under **User Settings → Advanced → Developer Mode**. After that, right-click a server or channel and select **Copy ID**.
 

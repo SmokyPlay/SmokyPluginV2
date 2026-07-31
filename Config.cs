@@ -19,7 +19,7 @@ namespace SmokyPluginV2
         [Description("Whether to restart an active round after the last player leaves the server.")]
         public bool RestartEmptyRound { get; set; } = true;
 
-        [Description("MariaDB storage shared by statistics, account links and warnings.")]
+        [Description("PostgreSQL storage shared by statistics, account links and punishment history.")]
         public DatabaseSettings Database { get; set; } = new DatabaseSettings();
 
         [Description("Persistent player and server statistics settings.")]
@@ -43,7 +43,7 @@ namespace SmokyPluginV2
         [Description("Pre-round role preference UI and role assignment settings.")]
         public RolePreferenceSettings RolePreferences { get; set; } = new RolePreferenceSettings();
 
-        [Description("Persistent player warning settings.")]
+        [Description("Persistent moderation history and warning notification settings.")]
         public WarningSettings Warnings { get; set; } = new WarningSettings();
 
         [Description("Discord bot settings.")]
@@ -55,7 +55,7 @@ namespace SmokyPluginV2
 
     public sealed class DatabaseSettings
     {
-        [Description("Whether MariaDB persistence is enabled. Warnings, account links and statistics require it.")]
+        [Description("Whether PostgreSQL persistence is enabled. Warnings, account links and statistics require it.")]
         public bool IsEnabled { get; set; } = true;
 
         [Description("Human-readable server name shown in statistics.")]
@@ -320,10 +320,10 @@ namespace SmokyPluginV2
 
     public sealed class WarningSettings
     {
-        [Description("Whether the persistent warning system and its Remote Admin commands are enabled.")]
+        [Description("Whether persistent punishment history and its commands are enabled.")]
         public bool IsEnabled { get; set; } = true;
 
-        [Description("Whether an online player should receive a broadcast when warned.")]
+        [Description("Whether players should receive warning notifications through in-game broadcasts or linked Discord direct messages.")]
         public bool NotifyPlayer { get; set; } = true;
 
         [Description("Warning broadcast duration in seconds.")]

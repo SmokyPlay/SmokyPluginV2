@@ -36,7 +36,7 @@ namespace SmokyPluginV2.Commands
                 !player.IsConnected ||
                 player.IsHost ||
                 player.IsNPC ||
-                !Database.MariaDbService.IsSteamUserId(player.UserId))
+                !Database.PostgreSqlService.IsSteamUserId(player.UserId))
             {
                 response = "Не удалось определить ваш Steam-аккаунт.";
                 return false;

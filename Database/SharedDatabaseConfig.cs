@@ -13,7 +13,7 @@ namespace SmokyPluginV2.Database
     {
         public string Host { get; set; } = "127.0.0.1";
 
-        public ushort Port { get; set; } = 3306;
+        public ushort Port { get; set; } = 5432;
 
         public string Name { get; set; } = "smoky_plugin_v2";
 
@@ -45,7 +45,7 @@ namespace SmokyPluginV2.Database
             {
                 CreateTemplate();
                 throw new InvalidOperationException(
-                    $"Shared MariaDB configuration was created at '{FilePath}'. Fill it in and restart the server.");
+                    $"Shared PostgreSQL configuration was created at '{FilePath}'. Fill it in and restart the server.");
             }
 
             string yaml = File.ReadAllText(FilePath, Encoding.UTF8);
@@ -56,7 +56,7 @@ namespace SmokyPluginV2.Database
                 .Deserialize<SharedDatabaseSettings>(yaml) ?? new SharedDatabaseSettings();
 
             if (string.Equals(settings.Password, "CHANGE_ME", StringComparison.Ordinal))
-                throw new InvalidOperationException($"Set the MariaDB password in '{FilePath}' and restart the server.");
+                throw new InvalidOperationException($"Set the PostgreSQL password in '{FilePath}' and restart the server.");
 
             return settings;
         }

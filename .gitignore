@@ -7,8 +7,11 @@ obj/
 *.pdb
 *.zip
 *.tar.gz
+__pycache__/
+*.pyc
 
 # Runtime database provider shipped with the EXILED plugin.
 !lib/
-!lib/MySqlConnector/
-!lib/MySqlConnector/MySqlConnector.dll
+!lib/Npgsql/
+!lib/Npgsql/*.dll
+!lib/Npgsql/THIRD-PARTY-NOTICE.md

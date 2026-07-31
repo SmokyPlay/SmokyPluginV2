@@ -37,7 +37,7 @@ namespace SmokyPluginV2.Commands
             StatisticsService statistics = Plugin.Instance?.Statistics;
             if (statistics is null || settings?.IsEnabled != true)
             {
-                response = "Система статистики отключена или MariaDB недоступна.";
+                response = "Система статистики отключена или PostgreSQL недоступна.";
                 return false;
             }
 

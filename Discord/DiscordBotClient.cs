@@ -122,6 +122,36 @@ namespace SmokyPluginV2.Discord
             EnqueueOutbound(OutboundMessage.Text(channelId, Limit(content, 1990)), true);
         }
 
+        public async Task<bool> SendDirectEmbedAsync(ulong discordUserId, string title, string description, int color)
+        {
+            if (discordUserId == 0 || disposed || !IsReady)
+                return false;
+
+            try
+            {
+                ulong channelId = await GetOrCreateDirectMessageChannelAsync(discordUserId, cancellation.Token).ConfigureAwait(false);
+                if (channelId == 0)
+                    return false;
+
+                Dictionary<string, object> payload = BuildPayload(new[]
+                {
+                    OutboundMessage.Embed(channelId, Limit(title, 256), Limit(description, 4000), color),
+                });
+                payload["nonce"] = Guid.NewGuid().ToString("N").Substring(0, 25);
+                payload["enforce_nonce"] = true;
+                return await SendMessageWithRetryAsync(channelId, payload, cancellation.Token, false).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+            {
+                return false;
+            }
+            catch (Exception exception)
+            {
+                Log.Warn($"[Discord] Could not deliver a direct message to user {discordUserId}: {exception.Message}");
+                return false;
+            }
+        }
+
         public void UpdatePresence(int players, int maxPlayers)
         {
             presenceText = settings.StatusText
@@ -553,7 +583,7 @@ namespace SmokyPluginV2.Discord
                 return;
             }
 
-            RaiseGuildMemberAvailable(guildId, userId);
+            RaiseGuildMemberAvailable(guildId, userId, ParseRoleIds(data));
         }
 
         private void HandleGuildMemberUpdate(Dictionary<string, object> data)
@@ -571,10 +601,10 @@ namespace SmokyPluginV2.Discord
 
             bool pending = Convert.ToBoolean(pendingValue, CultureInfo.InvariantCulture);
             if (!pending && pendingGuildMembers.TryRemove(userId, out _))
-                RaiseGuildMemberAvailable(guildId, userId);
+                RaiseGuildMemberAvailable(guildId, userId, ParseRoleIds(data));
         }
 
-        private void RaiseGuildMemberAvailable(ulong guildId, ulong userId)
+        private void RaiseGuildMemberAvailable(ulong guildId, ulong userId, ulong[] roleIds)
         {
             Task.Run(() =>
             {
@@ -584,6 +614,7 @@ namespace SmokyPluginV2.Discord
                     {
                         GuildId = guildId,
                         UserId = userId,
+                        RoleIds = roleIds ?? Array.Empty<ulong>(),
                     });
                 }
                 catch (Exception exception)
@@ -604,7 +635,7 @@ namespace SmokyPluginV2.Discord
             int interactionType = data.TryGetValue("type", out object typeValue)
                 ? Convert.ToInt32(typeValue, CultureInfo.InvariantCulture)
                 : 0;
-            if (interactionType != 2)
+            if (interactionType != 2 && interactionType != 3)
                 return;
 
             Dictionary<string, object> commandData = data.TryGetValue("data", out object commandValue) ? Json.Object(commandValue) : null;
@@ -619,10 +650,13 @@ namespace SmokyPluginV2.Discord
                 Token = data.TryGetValue("token", out object tokenValue) ? tokenValue as string : null,
                 GuildId = ParseSnowflake(data, "guild_id"),
                 UserId = ParseSnowflake(user, "id"),
+                RoleIds = ParseRoleIds(member),
                 TargetDiscordUserId = ParseCommandOptionSnowflake(commandData, "discord"),
                 SteamId = ParseCommandOptionString(commandData, "steam_id"),
                 StatisticsVisibility = ParseCommandOptionString(commandData, "доступ"),
                 CommandName = commandData != null && commandData.TryGetValue("name", out object nameValue) ? nameValue as string : null,
+                CustomId = commandData != null && commandData.TryGetValue("custom_id", out object customIdValue) ? customIdValue as string : null,
+                IsComponent = interactionType == 3,
             };
 
             DiscordInteractionResponse interactionResponse;
@@ -745,6 +779,28 @@ namespace SmokyPluginV2.Discord
                         },
                     });
                 }
+                if (Plugin.Instance?.Punishments != null)
+                {
+                    commandList.Add(new Dictionary<string, object>
+                    {
+                        ["name"] = "punishments",
+                        ["description"] = "Показать историю наказаний игрока",
+                        ["type"] = 1,
+                        ["options"] = new object[]
+                        {
+                            new Dictionary<string, object>
+                            {
+                                ["name"] = "discord", ["description"] = "Discord-аккаунт игрока",
+                                ["type"] = 6, ["required"] = false,
+                            },
+                            new Dictionary<string, object>
+                            {
+                                ["name"] = "steam_id", ["description"] = "SteamID64 игрока без @steam",
+                                ["type"] = 3, ["required"] = false, ["min_length"] = 17, ["max_length"] = 17,
+                            },
+                        },
+                    });
+                }
                 object[] commands = commandList.ToArray();
 
                 int failedAttempts = 0;
@@ -821,12 +877,13 @@ namespace SmokyPluginV2.Discord
             {
                 Dictionary<string, object> responseData = new Dictionary<string, object>
                 {
-                    ["flags"] = response?.Ephemeral == false ? 0 : 64,
                     ["allowed_mentions"] = new Dictionary<string, object>
                     {
                         ["parse"] = new object[0],
                     },
                 };
+                if (response?.UpdateMessage != true)
+                    responseData["flags"] = response?.Ephemeral == false ? 0 : 64;
                 if (!string.IsNullOrWhiteSpace(response?.Content))
                     responseData["content"] = Limit(response.Content, 1900);
                 if (response?.Embed != null)
@@ -853,10 +910,22 @@ namespace SmokyPluginV2.Discord
                     }
                     responseData["embeds"] = new object[] { embedPayload };
                 }
+                if (response?.Components != null && response.Components.Length > 0)
+                {
+                    responseData["components"] = response.Components.Select(row => new Dictionary<string, object>
+                    {
+                        ["type"] = 1,
+                        ["components"] = (row.Buttons ?? Array.Empty<DiscordButton>()).Select(button => new Dictionary<string, object>
+                        {
+                            ["type"] = 2, ["style"] = button.Style, ["custom_id"] = button.CustomId,
+                            ["label"] = Limit(button.Label, 80), ["disabled"] = button.Disabled,
+                        }).ToArray(),
+                    }).ToArray();
+                }
 
                 Dictionary<string, object> payload = new Dictionary<string, object>
                 {
-                    ["type"] = 4,
+                    ["type"] = response?.UpdateMessage == true ? 7 : 4,
                     ["data"] = responseData,
                 };
 
@@ -1122,16 +1191,17 @@ namespace SmokyPluginV2.Discord
             payload["nonce"] = Guid.NewGuid().ToString("N").Substring(0, 25);
             payload["enforce_nonce"] = true;
 
-            await SendMessageWithRetryAsync(channelId, payload, token).ConfigureAwait(false);
+            await SendMessageWithRetryAsync(channelId, payload, token, true).ConfigureAwait(false);
         }
 
-        private async Task SendMessageWithRetryAsync(
+        private async Task<bool> SendMessageWithRetryAsync(
             ulong channelId,
             Dictionary<string, object> payload,
-            CancellationToken token)
+            CancellationToken token,
+            bool blockChannelOnClientError)
         {
-            if (IsMessageChannelBlocked(channelId))
-                return;
+            if (blockChannelOnClientError && IsMessageChannelBlocked(channelId))
+                return false;
 
             string json = Json.Serialize(payload);
             int transientFailures = 0;
@@ -1149,7 +1219,7 @@ namespace SmokyPluginV2.Discord
                             if (response.IsSuccessStatusCode)
                             {
                                 await WaitForExhaustedMessageBucketAsync(response, token).ConfigureAwait(false);
-                                return;
+                                return true;
                             }
 
                             string responseText = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
@@ -1174,19 +1244,21 @@ namespace SmokyPluginV2.Discord
                             {
                                 BlockRestRequests(ConfirmedGlobalRateLimitCooldownSeconds);
                                 Log.Error("[Discord] REST authorization was rejected. All Discord REST requests are paused for one hour to prevent an invalid-request ban.");
-                                return;
+                                return false;
                             }
 
                             if ((int)response.StatusCode == 403 || (int)response.StatusCode == 404)
                             {
-                                BlockMessageChannel(channelId, response.StatusCode, responseText);
-                                return;
+                                if (blockChannelOnClientError)
+                                    BlockMessageChannel(channelId, response.StatusCode, responseText);
+                                return false;
                             }
 
                             if ((int)response.StatusCode >= 400 && (int)response.StatusCode < 500)
                             {
-                                BlockMessageChannel(channelId, response.StatusCode, responseText);
-                                return;
+                                if (blockChannelOnClientError)
+                                    BlockMessageChannel(channelId, response.StatusCode, responseText);
+                                return false;
                             }
 
                             throw new InvalidOperationException($"Discord returned {(int)response.StatusCode}: {responseText}");
@@ -1206,6 +1278,79 @@ namespace SmokyPluginV2.Discord
                     await Task.Delay(TimeSpan.FromMilliseconds(500 * transientFailures), token).ConfigureAwait(false);
                 }
             }
+
+            return false;
+        }
+
+        private async Task<ulong> GetOrCreateDirectMessageChannelAsync(ulong discordUserId, CancellationToken token)
+        {
+            string json = Json.Serialize(new Dictionary<string, object>
+            {
+                ["recipient_id"] = discordUserId.ToString(CultureInfo.InvariantCulture),
+            });
+            int transientFailures = 0;
+
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    using (HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, "users/@me/channels"))
+                    {
+                        request.Content = new StringContent(json, Encoding.UTF8, "application/json");
+                        using (HttpResponseMessage response = await SendWithHardTimeoutAsync(request, token).ConfigureAwait(false))
+                        {
+                            string responseText = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                            if (response.IsSuccessStatusCode)
+                            {
+                                Dictionary<string, object> channel = Json.DeserializeObject(responseText);
+                                if (channel != null && channel.TryGetValue("id", out object rawId) &&
+                                    ulong.TryParse(Convert.ToString(rawId, CultureInfo.InvariantCulture), NumberStyles.None, CultureInfo.InvariantCulture, out ulong channelId))
+                                {
+                                    return channelId;
+                                }
+
+                                return 0;
+                            }
+
+                            if ((int)response.StatusCode == 429)
+                            {
+                                await WaitForRestWindowAsync(token).ConfigureAwait(false);
+                                continue;
+                            }
+
+                            if ((int)response.StatusCode == 408 || (int)response.StatusCode >= 500)
+                            {
+                                if (++transientFailures >= 3)
+                                    return 0;
+                                await Task.Delay(TimeSpan.FromMilliseconds(500 * transientFailures), token).ConfigureAwait(false);
+                                continue;
+                            }
+
+                            if ((int)response.StatusCode == 401)
+                            {
+                                BlockRestRequests(ConfirmedGlobalRateLimitCooldownSeconds);
+                                Log.Error("[Discord] REST authorization was rejected while opening a direct message channel.");
+                            }
+
+                            return 0;
+                        }
+                    }
+                }
+                catch (TimeoutException)
+                {
+                    if (++transientFailures >= 3)
+                        return 0;
+                    await Task.Delay(TimeSpan.FromMilliseconds(500 * transientFailures), token).ConfigureAwait(false);
+                }
+                catch (HttpRequestException)
+                {
+                    if (++transientFailures >= 3)
+                        return 0;
+                    await Task.Delay(TimeSpan.FromMilliseconds(500 * transientFailures), token).ConfigureAwait(false);
+                }
+            }
+
+            return 0;
         }
 
         private static async Task WaitForExhaustedMessageBucketAsync(HttpResponseMessage response, CancellationToken token)

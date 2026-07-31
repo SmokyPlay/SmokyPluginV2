@@ -25,6 +25,8 @@ namespace SmokyPluginV2.Privileges
             new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, object> unlinkTokens =
             new ConcurrentDictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<ulong, object> unlinkDiscordUsers =
+            new ConcurrentDictionary<ulong, object>();
         private readonly ConcurrentDictionary<string, string[]> resolvedPrivilegeGroups =
             new ConcurrentDictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, string[]> resolvedDiscordGroups =
@@ -64,6 +66,7 @@ namespace SmokyPluginV2.Privileges
             synchronizedGroups.Clear();
             synchronizationVersions.Clear();
             unlinkTokens.Clear();
+            unlinkDiscordUsers.Clear();
             resolvedPrivilegeGroups.Clear();
             resolvedDiscordGroups.Clear();
             temporaryRolePreferenceWeights.Clear();
@@ -87,7 +90,7 @@ namespace SmokyPluginV2.Privileges
         public void SynchronizeBySteamId(string playerUserId, bool notifyPlayer = false)
         {
             if (disposed || string.IsNullOrWhiteSpace(playerUserId) ||
-                !MariaDbService.IsSteamUserId(playerUserId))
+                !PostgreSqlService.IsSteamUserId(playerUserId))
             {
                 return;
             }
@@ -98,22 +101,25 @@ namespace SmokyPluginV2.Privileges
 
             Task.Run(async () =>
             {
-                if (!privileges.TryResolveBySteamId(
-                        playerUserId,
-                        out PlayerAccessSnapshot snapshot,
-                        out string databaseError))
+                AccessResolutionResult resolution = await ResolveBySteamIdAsync(
+                    playerUserId,
+                    currentDiscordSettings).ConfigureAwait(false);
+                if (!resolution.IsSuccess)
                 {
-                    NotifyFailure(playerUserId, version, notifyPlayer, databaseError);
+                    NotifyFailure(playerUserId, version, notifyPlayer, resolution.Error);
                     return;
                 }
 
                 await SynchronizeResolvedSnapshotAsync(
                     playerUserId,
-                    snapshot,
+                    resolution.Snapshot,
+                    resolution.DiscordMember,
                     currentDiscordSettings,
                     version,
                     pendingUnlinkToken,
-                    notifyPlayer).ConfigureAwait(false);
+                    notifyPlayer,
+                    applyGameAccess: true,
+                    shouldContinue: () => IsCurrent(playerUserId, version)).ConfigureAwait(false);
             });
         }
 
@@ -125,17 +131,18 @@ namespace SmokyPluginV2.Privileges
             DiscordSettings currentDiscordSettings = discordSettings ?? new DiscordSettings();
             Task.Run(async () =>
             {
-                if (!privileges.TryResolveByDiscordId(
-                        discordUserId,
-                        out PlayerAccessSnapshot snapshot,
-                        out string databaseError))
+                AccessResolutionResult resolution = await ResolveByDiscordIdAsync(
+                    discordUserId,
+                    null).ConfigureAwait(false);
+                if (!resolution.IsSuccess)
                 {
                     Log.Error(
                         $"[PlayerAccess] Synchronization by Discord ID {discordUserId} failed: " +
-                        $"{databaseError ?? "unknown database error"}");
+                        $"{resolution.Error ?? "unknown database error"}");
                     return;
                 }
 
+                PlayerAccessSnapshot snapshot = resolution.Snapshot;
                 if (snapshot == null || string.IsNullOrWhiteSpace(snapshot.PlayerUserId))
                     return;
 
@@ -148,15 +155,19 @@ namespace SmokyPluginV2.Privileges
                 await SynchronizeResolvedSnapshotAsync(
                     playerUserId,
                     snapshot,
+                    resolution.DiscordMember,
                     currentDiscordSettings,
                     version,
                     pendingUnlinkToken,
-                    notifyPlayer).ConfigureAwait(false);
+                    notifyPlayer,
+                    applyGameAccess: true,
+                    shouldContinue: () => IsCurrent(playerUserId, version)).ConfigureAwait(false);
             });
         }
 
         public Task<DiscordRoleSynchronizationResult> SynchronizeDiscordRolesByDiscordIdAsync(
-            ulong discordUserId)
+            ulong discordUserId,
+            DiscordGuildMemberResult knownMember = null)
         {
             if (disposed || discordUserId == 0)
             {
@@ -167,51 +178,52 @@ namespace SmokyPluginV2.Privileges
                 });
             }
 
+            if (unlinkDiscordUsers.ContainsKey(discordUserId))
+            {
+                return Task.FromResult(new DiscordRoleSynchronizationResult
+                {
+                    IsCanceled = true,
+                    Error = "Discord account unlink cleanup is in progress.",
+                });
+            }
+
             DiscordSettings currentDiscordSettings = discordSettings ?? new DiscordSettings();
             return Task.Run(async () =>
             {
-                if (!privileges.TryResolveByDiscordId(
-                        discordUserId,
-                        out PlayerAccessSnapshot snapshot,
-                        out string databaseError))
+                AccessResolutionResult resolution = await ResolveByDiscordIdAsync(
+                    discordUserId,
+                    knownMember).ConfigureAwait(false);
+                if (!resolution.IsSuccess)
                 {
                     Log.Error(
                         $"[PlayerAccess] Discord-only synchronization for {discordUserId} failed: " +
-                        $"{databaseError ?? "unknown database error"}");
+                        $"{resolution.Error ?? "unknown database error"}");
                     return new DiscordRoleSynchronizationResult
                     {
-                        Error = databaseError ?? "Database privilege resolution failed.",
+                        Error = resolution.Error ?? "Database privilege resolution failed.",
                     };
                 }
 
-                if (disposed || snapshot == null || discordRoles == null)
+                PlayerAccessSnapshot snapshot = resolution.Snapshot;
+                if (disposed || snapshot == null)
                 {
                     return new DiscordRoleSynchronizationResult
                     {
                         IsCanceled = disposed,
-                        Error = discordRoles == null ? "Discord role service is unavailable." : null,
+                        Error = snapshot == null ? "Database privilege resolution returned no snapshot." : null,
                     };
                 }
 
-                bool accountLinkingEnabled =
-                    currentDiscordSettings.AccountLinking?.IsEnabled == true;
-                bool isSteamLinked = accountLinkingEnabled &&
-                    !string.IsNullOrWhiteSpace(snapshot.PlayerUserId);
-                DiscordRoleSynchronizationResult result =
-                    await discordRoles.SynchronizeAsync(
-                            discordUserId,
-                            snapshot.PrivilegeGroups,
-                            snapshot.ManagedDiscordGroups,
-                            GetValidMappings(currentDiscordSettings),
-                            isSteamLinked,
-                            accountLinkingEnabled
-                                ? currentDiscordSettings.AccountLinking?.LinkedDiscordRoleId ?? 0
-                                : 0,
-                            () => !disposed)
-                        .ConfigureAwait(false);
-
-                if (result?.ReconciliationTask != null)
-                    await result.ReconciliationTask.ConfigureAwait(false);
+                DiscordRoleSynchronizationResult result = await SynchronizeResolvedSnapshotAsync(
+                    snapshot.PlayerUserId,
+                    snapshot,
+                    resolution.DiscordMember,
+                    currentDiscordSettings,
+                    0,
+                    null,
+                    notifyPlayer: false,
+                    applyGameAccess: false,
+                    shouldContinue: () => !disposed && !unlinkDiscordUsers.ContainsKey(discordUserId)).ConfigureAwait(false);
 
                 if (result == null || !result.IsSuccess)
                 {
@@ -245,26 +257,24 @@ namespace SmokyPluginV2.Privileges
                 (_, current) => unchecked(current + 1));
             object unlinkToken = new object();
             unlinkTokens[playerUserId] = unlinkToken;
+            unlinkDiscordUsers[previousDiscordUserId] = unlinkToken;
             DiscordSettings currentDiscordSettings = discordSettings ?? new DiscordSettings();
-            Task<PrivilegeResolutionResult> steamResolutionTask = Task.Run(() =>
-            {
-                bool success = privileges.TryResolveBySteamId(
-                    playerUserId,
-                    out PlayerAccessSnapshot snapshot,
-                    out string error);
-                return new PrivilegeResolutionResult
-                {
-                    IsSuccess = success,
-                    Snapshot = snapshot,
-                    Error = error,
-                };
-            });
 
             Task.Run(async () =>
             {
                 try
                 {
-                    PrivilegeResolutionResult steamResolution =
+                    Task<AccessResolutionResult> steamResolutionTask =
+                        ResolveBySteamIdAsync(playerUserId, currentDiscordSettings);
+                    Task<AccessResolutionResult> discordResolutionTask = ResolveIdentityAsync(
+                        new PlayerAccessIdentity
+                        {
+                            DiscordUserId = previousDiscordUserId,
+                        },
+                        true,
+                        null);
+
+                    AccessResolutionResult steamResolution =
                         await steamResolutionTask.ConfigureAwait(false);
                     if (!steamResolution.IsSuccess)
                     {
@@ -272,29 +282,43 @@ namespace SmokyPluginV2.Privileges
                             $"[PlayerAccess] Steam privilege resolution after unlink failed for " +
                             $"{playerUserId}: {steamResolution.Error ?? "unknown database error"}");
                     }
+                    else if (IsCurrent(playerUserId, version))
+                    {
+                        ApplyResolvedAccess(
+                            playerUserId,
+                            steamResolution.Snapshot,
+                            null,
+                            currentDiscordSettings,
+                            version,
+                            notifyPlayer);
+                    }
 
-                    PlayerAccessSnapshot discordSnapshot = null;
-                    if (!privileges.TryResolveByDiscordId(
-                            previousDiscordUserId,
-                            out discordSnapshot,
-                            out string discordDatabaseError))
+                    AccessResolutionResult discordResolution =
+                        await discordResolutionTask.ConfigureAwait(false);
+                    if (!discordResolution.IsSuccess)
                     {
                         Log.Error(
                             $"[PlayerAccess] Discord privilege resolution after unlink failed for " +
-                            $"{previousDiscordUserId}: {discordDatabaseError ?? "unknown database error"}");
+                            $"{previousDiscordUserId}: {discordResolution.Error ?? "unknown database error"}");
                     }
 
-                    if (discordSnapshot != null &&
+                    PlayerAccessSnapshot discordSnapshot = discordResolution.Snapshot;
+                    if (discordResolution.IsSuccess &&
+                        discordSnapshot != null &&
                         IsUnlinkCurrent(playerUserId, unlinkToken) &&
                         discordRoles != null &&
                         currentDiscordSettings.AccountLinking?.IsEnabled == true)
                     {
                         DiscordRoleSynchronizationResult unlinkDiscordResult =
-                            await discordRoles.SynchronizeAsync(
+                            discordRoles.Synchronize(
                                 previousDiscordUserId,
+                                discordResolution.DiscordMember,
                                 discordSnapshot.DiscordPrivilegeGroups,
                                 steamResolution.IsSuccess && steamResolution.Snapshot != null
                                     ? steamResolution.Snapshot.SteamPrivilegeGroups
+                                        .Union(
+                                            steamResolution.Snapshot.ManagedDiscordGroups ?? Array.Empty<string>(),
+                                            StringComparer.OrdinalIgnoreCase)
                                         .Union(
                                             discordSnapshot.ManagedDiscordGroups ?? Array.Empty<string>(),
                                             StringComparer.OrdinalIgnoreCase)
@@ -303,54 +327,21 @@ namespace SmokyPluginV2.Privileges
                                 GetValidMappings(currentDiscordSettings),
                                 false,
                                 currentDiscordSettings.AccountLinking?.LinkedDiscordRoleId ?? 0,
-                                () => IsUnlinkCurrent(playerUserId, unlinkToken))
-                            .ConfigureAwait(false);
-                        if (unlinkDiscordResult?.ReconciliationTask != null)
-                            await unlinkDiscordResult.ReconciliationTask.ConfigureAwait(false);
+                                () => IsUnlinkCurrent(playerUserId, unlinkToken));
+                        await FinalizeReconciliationAsync(
+                            CombineRevocations(
+                                steamResolution.Snapshot,
+                                discordSnapshot),
+                            unlinkDiscordResult,
+                            currentDiscordSettings).ConfigureAwait(false);
                     }
                 }
                 finally
                 {
                     RemoveUnlinkToken(playerUserId, unlinkToken);
+                    RemoveUnlinkDiscordUser(previousDiscordUserId, unlinkToken);
                 }
             });
-
-            MainThreadDispatcher.Dispatch(
-                () =>
-                {
-                    if (!IsCurrent(playerUserId, version) ||
-                        !IsRealPlayer(Player.Get(playerUserId)))
-                    {
-                        return;
-                    }
-
-                    Task.Run(async () =>
-                    {
-                        PrivilegeResolutionResult steamResolution =
-                            await steamResolutionTask.ConfigureAwait(false);
-                        if (!steamResolution.IsSuccess || steamResolution.Snapshot == null)
-                        {
-                            NotifyFailure(
-                                playerUserId,
-                                version,
-                                notifyPlayer,
-                                steamResolution.Error);
-                            return;
-                        }
-
-                        if (!IsCurrent(playerUserId, version))
-                            return;
-
-                        ApplyResolvedAccess(
-                            playerUserId,
-                            steamResolution.Snapshot,
-                            null,
-                            currentDiscordSettings,
-                            version,
-                            notifyPlayer);
-                    });
-                },
-                MainThreadDispatcher.DispatchTime.FixedUpdate);
         }
 
         public void ApplyResolvedAccess(
@@ -446,44 +437,220 @@ namespace SmokyPluginV2.Privileges
 
         private void OnLeft(LeftEventArgs ev) => Forget(ev.Player);
 
-        private async Task SynchronizeResolvedSnapshotAsync(
+        private async Task<AccessResolutionResult> ResolveBySteamIdAsync(
+            string playerUserId,
+            DiscordSettings currentDiscordSettings)
+        {
+            if (!privileges.TryResolveIdentityBySteamId(
+                    playerUserId,
+                    out PlayerAccessIdentity identity,
+                    out string identityError))
+            {
+                return AccessResolutionResult.Failed(identityError);
+            }
+
+            return await ResolveIdentityAsync(
+                identity,
+                currentDiscordSettings?.AccountLinking?.IsEnabled == true,
+                null).ConfigureAwait(false);
+        }
+
+        private async Task<AccessResolutionResult> ResolveByDiscordIdAsync(
+            ulong discordUserId,
+            DiscordGuildMemberResult knownMember)
+        {
+            if (!privileges.TryResolveIdentityByDiscordId(
+                    discordUserId,
+                    out PlayerAccessIdentity identity,
+                    out string identityError))
+            {
+                return AccessResolutionResult.Failed(identityError);
+            }
+
+            return await ResolveIdentityAsync(
+                identity,
+                true,
+                knownMember).ConfigureAwait(false);
+        }
+
+        private async Task<AccessResolutionResult> ResolveIdentityAsync(
+            PlayerAccessIdentity identity,
+            bool lookupDiscordMember,
+            DiscordGuildMemberResult knownMember)
+        {
+            Task<PrivilegeResolutionResult> privilegeTask = Task.Run(() =>
+            {
+                bool success = privileges.TryResolve(
+                    identity,
+                    out PlayerAccessSnapshot snapshot,
+                    out string error);
+                return new PrivilegeResolutionResult
+                {
+                    IsSuccess = success,
+                    Snapshot = snapshot,
+                    Error = error,
+                };
+            });
+
+            Task<DiscordGuildMemberResult> memberTask = null;
+            if (identity?.DiscordUserId != 0 &&
+                discordRoles != null &&
+                lookupDiscordMember)
+            {
+                memberTask = knownMember != null
+                    ? Task.FromResult(knownMember)
+                    : discordRoles.GetGuildMemberAsync(identity.DiscordUserId);
+            }
+
+            PrivilegeResolutionResult privilegeResolution =
+                await privilegeTask.ConfigureAwait(false);
+            DiscordGuildMemberResult member = memberTask != null
+                ? await memberTask.ConfigureAwait(false)
+                : null;
+            return new AccessResolutionResult
+            {
+                IsSuccess = privilegeResolution.IsSuccess,
+                Snapshot = privilegeResolution.Snapshot,
+                DiscordMember = member,
+                Error = privilegeResolution.Error,
+            };
+        }
+
+        private async Task FinalizeReconciliationAsync(
+            PlayerAccessSnapshot snapshot,
+            DiscordRoleSynchronizationResult synchronization,
+            DiscordSettings currentDiscordSettings)
+        {
+            if (synchronization?.ReconciliationTask == null)
+                return;
+
+            try
+            {
+                DiscordRoleReconciliationReport report =
+                    await synchronization.ReconciliationTask.ConfigureAwait(false);
+                if (report == null ||
+                    report.IsCanceled ||
+                    snapshot?.PendingRevocations == null ||
+                    snapshot.PendingRevocations.Count == 0)
+                {
+                    return;
+                }
+
+                List<DiscordRoleGroupMapping> mappings = GetValidMappings(currentDiscordSettings);
+                List<PendingPrivilegeRevocation> settled = snapshot.PendingRevocations
+                    .Where(revocation =>
+                    {
+                        DiscordRoleGroupMapping mapping = mappings.FirstOrDefault(candidate =>
+                            string.Equals(
+                                candidate.RemoteAdminGroup?.Trim(),
+                                revocation?.GroupName?.Trim(),
+                                StringComparison.OrdinalIgnoreCase));
+                        return mapping != null && report.IsRemovalSettled(mapping.DiscordRoleId);
+                    })
+                    .ToList();
+                if (settled.Count == 0)
+                    return;
+
+                if (!privileges.TryFinalizeRevocations(settled, out string error))
+                {
+                    Log.Error(
+                        $"[PlayerAccess] Could not finalize {settled.Count} settled privilege " +
+                        $"revocation(s) in PostgreSQL: {error ?? "unknown database error"}");
+                }
+            }
+            catch (Exception exception)
+            {
+                Log.Error($"[PlayerAccess] Privilege revocation finalization failed: {exception}");
+            }
+        }
+
+        private static PlayerAccessSnapshot CombineRevocations(
+            params PlayerAccessSnapshot[] snapshots) =>
+            new PlayerAccessSnapshot
+            {
+                PendingRevocations = (snapshots ?? Array.Empty<PlayerAccessSnapshot>())
+                    .Where(snapshot => snapshot?.PendingRevocations != null)
+                    .SelectMany(snapshot => snapshot.PendingRevocations)
+                    .ToArray(),
+            };
+
+        private async Task<DiscordRoleSynchronizationResult> SynchronizeResolvedSnapshotAsync(
             string playerUserId,
             PlayerAccessSnapshot snapshot,
+            DiscordGuildMemberResult discordMember,
             DiscordSettings currentDiscordSettings,
             int version,
             object pendingUnlinkToken,
-            bool notifyPlayer)
+            bool notifyPlayer,
+            bool applyGameAccess,
+            Func<bool> shouldContinue)
         {
+            if (snapshot == null)
+            {
+                return new DiscordRoleSynchronizationResult
+                {
+                    Error = "Privilege resolution returned no snapshot.",
+                };
+            }
+
             List<DiscordRoleGroupMapping> mappings = GetValidMappings(currentDiscordSettings);
-            bool hasDiscordLink = snapshot.DiscordUserId != 0 &&
+            bool accountLinkingEnabled =
                 currentDiscordSettings.AccountLinking?.IsEnabled == true;
-            if (hasDiscordLink && pendingUnlinkToken != null)
+            bool shouldSynchronizeDiscord = snapshot.DiscordUserId != 0 &&
+                (!applyGameAccess || accountLinkingEnabled);
+            if (shouldSynchronizeDiscord && pendingUnlinkToken != null)
                 RemoveUnlinkToken(playerUserId, pendingUnlinkToken);
 
             DiscordRoleSynchronizationResult discordResult = null;
-            if (hasDiscordLink && discordRoles != null)
+            if (shouldSynchronizeDiscord && discordRoles != null)
             {
-                discordResult = await discordRoles.SynchronizeAsync(
-                        snapshot.DiscordUserId,
-                        snapshot.PrivilegeGroups,
-                        snapshot.ManagedDiscordGroups,
-                        mappings,
-                        true,
-                        currentDiscordSettings.AccountLinking?.LinkedDiscordRoleId ?? 0,
-                        () => IsCurrent(playerUserId, version))
-                    .ConfigureAwait(false);
+                discordResult = discordRoles.Synchronize(
+                    snapshot.DiscordUserId,
+                    discordMember,
+                    snapshot.PrivilegeGroups,
+                    snapshot.ManagedDiscordGroups,
+                    mappings,
+                    accountLinkingEnabled && !string.IsNullOrWhiteSpace(snapshot.PlayerUserId),
+                    accountLinkingEnabled
+                        ? currentDiscordSettings.AccountLinking?.LinkedDiscordRoleId ?? 0
+                        : 0,
+                    shouldContinue);
+            }
+            else if (shouldSynchronizeDiscord && !applyGameAccess)
+            {
+                return new DiscordRoleSynchronizationResult
+                {
+                    Error = "Discord role service is unavailable.",
+                };
             }
 
-            if (discordResult?.IsCanceled == true || !IsCurrent(playerUserId, version))
-                return;
+            if (discordResult?.IsCanceled == true || shouldContinue?.Invoke() == false)
+            {
+                return discordResult ?? new DiscordRoleSynchronizationResult
+                {
+                    IsCanceled = true,
+                };
+            }
 
-            ApplyResolvedAccess(
-                playerUserId,
+            if (applyGameAccess)
+            {
+                ApplyResolvedAccess(
+                    playerUserId,
+                    snapshot,
+                    discordResult,
+                    currentDiscordSettings,
+                    version,
+                    notifyPlayer);
+            }
+
+            await FinalizeReconciliationAsync(
                 snapshot,
                 discordResult,
-                currentDiscordSettings,
-                version,
-                notifyPlayer);
+                currentDiscordSettings).ConfigureAwait(false);
+            return discordResult ?? new DiscordRoleSynchronizationResult
+            {
+                IsSuccess = !shouldSynchronizeDiscord,
+            };
         }
 
         private void ApplyResolvedAccess(
@@ -609,7 +776,7 @@ namespace SmokyPluginV2.Privileges
                 }
 
                 if (notifyPlayer)
-                    player.SendConsoleMessage("Подходящие привилегии в MariaDB или Discord не найдены.", "yellow");
+                    player.SendConsoleMessage("Подходящие привилегии в PostgreSQL или Discord не найдены.", "yellow");
                 return;
             }
 
@@ -658,7 +825,7 @@ namespace SmokyPluginV2.Privileges
                     if (!IsCurrent(playerUserId, version))
                         return;
                     Player.Get(playerUserId)?.SendConsoleMessage(
-                        "Не удалось синхронизировать привилегии из MariaDB. Повторите команду позже.",
+                        "Не удалось синхронизировать привилегии из PostgreSQL. Повторите команду позже.",
                         "red");
                 },
                 MainThreadDispatcher.DispatchTime.FixedUpdate);
@@ -729,12 +896,21 @@ namespace SmokyPluginV2.Privileges
                 new KeyValuePair<string, object>(playerUserId, token));
         }
 
+        private void RemoveUnlinkDiscordUser(ulong discordUserId, object token)
+        {
+            if (discordUserId == 0 || token == null)
+                return;
+
+            ((ICollection<KeyValuePair<ulong, object>>)unlinkDiscordUsers).Remove(
+                new KeyValuePair<ulong, object>(discordUserId, token));
+        }
+
         private static bool IsRealPlayer(Player player) =>
             player != null &&
             player.IsConnected &&
             !player.IsHost &&
             !player.IsNPC &&
-            MariaDbService.IsSteamUserId(player.UserId);
+            PostgreSqlService.IsSteamUserId(player.UserId);
 
         private sealed class PrivilegeResolutionResult
         {
@@ -743,6 +919,20 @@ namespace SmokyPluginV2.Privileges
             public PlayerAccessSnapshot Snapshot { get; set; }
 
             public string Error { get; set; }
+        }
+
+        private sealed class AccessResolutionResult
+        {
+            public bool IsSuccess { get; set; }
+
+            public PlayerAccessSnapshot Snapshot { get; set; }
+
+            public DiscordGuildMemberResult DiscordMember { get; set; }
+
+            public string Error { get; set; }
+
+            public static AccessResolutionResult Failed(string error) =>
+                new AccessResolutionResult { Error = error };
         }
     }
 }

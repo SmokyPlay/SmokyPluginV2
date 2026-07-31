@@ -40,7 +40,10 @@ namespace SmokyPluginV2.Discord
                 Description =
                     $"Приглашайте друзей и получите привилегию **{groupName}** после " +
                     $"**{requiredCount}** подтверждённых приглашений.\n\n" +
-                    $"Новый игрок должен ввести код в первые **{Math.Max(0, codeEntryMaxMinutes)} минут** игры. " +
+                    $"Новый игрок должен ввести ваш код в течение первых **{Math.Max(0, codeEntryMaxMinutes)} минут** игры на сервере.\n" +
+                    "После активации кода и до подтверждения приглашения он получит:\n" +
+                    "1. Повышенный шанс получить выбранную роль (преимущество x1.25);\n" +
+                    "2. Карту уборщика один раз за раунд по команде `.janitorcard` или `.jc`.\n" +
                     $"Приглашение подтверждается после **{Math.Max(1, qualificationMinutes)} минут** общего игрового времени.\n\n" +
                     "Код для копирования:\n" +
                     $"```text\n.ref {status?.ReferralCode}\n```",
@@ -111,7 +114,7 @@ namespace SmokyPluginV2.Discord
         private static string FormatName(ReferralParticipant participant)
         {
             string name = string.IsNullOrWhiteSpace(participant?.Nickname)
-                ? MariaDbDisplayId(participant?.PlayerUserId)
+                ? PostgreSqlDisplayId(participant?.PlayerUserId)
                 : DiscordLogService.Escape(participant.Nickname);
             if (name.Length <= MaximumDisplayedNameLength)
                 return name;
@@ -136,7 +139,7 @@ namespace SmokyPluginV2.Discord
             return $"{minutes} мин";
         }
 
-        private static string MariaDbDisplayId(string playerUserId)
+        private static string PostgreSqlDisplayId(string playerUserId)
         {
             string value = playerUserId ?? "неизвестный игрок";
             int suffix = value.IndexOf('@');

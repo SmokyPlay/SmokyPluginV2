@@ -36,7 +36,7 @@ namespace SmokyPluginV2.Statistics
 
     internal sealed class StatisticsService : IDisposable
     {
-        private readonly MariaDbService database;
+        private readonly PostgreSqlService database;
         private readonly BlockingCollection<Action> writeQueue = new BlockingCollection<Action>(5000);
         private readonly ConcurrentDictionary<string, DateTime> activePocketStarts = new ConcurrentDictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         private readonly Thread writerThread;
@@ -55,7 +55,7 @@ namespace SmokyPluginV2.Statistics
         private string lastTesla079UserId;
         private DateTime lastTesla079AtUtc;
 
-        public StatisticsService(MariaDbService database)
+        public StatisticsService(PostgreSqlService database)
         {
             this.database = database ?? throw new ArgumentNullException(nameof(database));
             writerThread = new Thread(ProcessWrites)
@@ -142,7 +142,7 @@ namespace SmokyPluginV2.Statistics
             writeQueue.CompleteAdding();
             bool writerStopped = writerThread.Join(TimeSpan.FromSeconds(10));
             if (!writerStopped)
-                Log.Warn("[Statistics] MariaDB writer did not stop within 10 seconds; queued updates may finish during shutdown.");
+                Log.Warn("[Statistics] PostgreSQL writer did not stop within 10 seconds; queued updates may finish during shutdown.");
             else
                 writeQueue.Dispose();
         }
@@ -208,7 +208,7 @@ namespace SmokyPluginV2.Statistics
 
             if (!completed.Wait(TimeSpan.FromSeconds(15)))
             {
-                error = "MariaDB не завершила очистку статистики за 15 секунд. Результат операции неизвестен; проверьте статистику перед повтором.";
+                error = "PostgreSQL не завершила очистку статистики за 15 секунд. Результат операции неизвестен; проверьте статистику перед повтором.";
                 return false;
             }
             completed.Dispose();
@@ -237,7 +237,7 @@ namespace SmokyPluginV2.Statistics
 
             if (!completed.Wait(TimeSpan.FromSeconds(15)))
             {
-                error = "MariaDB не успела синхронизировать статистику за 15 секунд. Повторите запрос.";
+                error = "PostgreSQL не успела синхронизировать статистику за 15 секунд. Повторите запрос.";
                 return false;
             }
 
@@ -250,7 +250,7 @@ namespace SmokyPluginV2.Statistics
             if (!IsRecording || statistics == null)
                 return;
 
-            string normalizedUserId = MariaDbService.NormalizeSteamId(userId);
+            string normalizedUserId = PostgreSqlService.NormalizeSteamId(userId);
             if (string.IsNullOrWhiteSpace(normalizedUserId) ||
                 !activePocketStarts.TryGetValue(normalizedUserId, out DateTime startedUtc))
                 return;
@@ -363,7 +363,7 @@ namespace SmokyPluginV2.Statistics
                 FlushStateIntervals(state, now, true);
                 players.Remove(ev.Player.UserId);
             }
-            activePocketStarts.TryRemove(MariaDbService.NormalizeSteamId(ev.Player.UserId), out _);
+            activePocketStarts.TryRemove(PostgreSqlService.NormalizeSteamId(ev.Player.UserId), out _);
             scp106AttackCredits.Remove(ev.Player.UserId);
             SafePlayerUpdate(ev.Player.UserId, ev.Player.Nickname, new PlayerStatDelta(), now);
         }
@@ -539,7 +539,7 @@ namespace SmokyPluginV2.Statistics
             state.InPocket = true;
             state.PocketSeconds = 0;
             state.PocketIntervalStartedUtc = now;
-            activePocketStarts[MariaDbService.NormalizeSteamId(player.UserId)] = now;
+            activePocketStarts[PostgreSqlService.NormalizeSteamId(player.UserId)] = now;
             if (scp106AttackCredits.TryGetValue(player.UserId, out Scp106AttackCredit credit))
                 credit.PocketEntryConfirmed = true;
             SafePlayerUpdate(player.UserId, player.Nickname, new PlayerStatDelta().Increment("pocket_entries"), now);
@@ -736,7 +736,7 @@ namespace SmokyPluginV2.Statistics
             state.InPocket = false;
             state.PocketSeconds = 0;
             state.PocketIntervalStartedUtc = null;
-            activePocketStarts.TryRemove(MariaDbService.NormalizeSteamId(state.UserId), out _);
+            activePocketStarts.TryRemove(PostgreSqlService.NormalizeSteamId(state.UserId), out _);
             return seconds;
         }
 
@@ -760,7 +760,7 @@ namespace SmokyPluginV2.Statistics
             if (state.InPocket)
             {
                 state.PocketIntervalStartedUtc = now;
-                activePocketStarts[MariaDbService.NormalizeSteamId(state.UserId)] = now;
+                activePocketStarts[PostgreSqlService.NormalizeSteamId(state.UserId)] = now;
             }
         }
 
@@ -838,7 +838,7 @@ namespace SmokyPluginV2.Statistics
         private void EnqueueWrite(Action action, string description)
         {
             if (writeQueue.IsAddingCompleted || !writeQueue.TryAdd(action))
-                Log.Error($"[Statistics] MariaDB write queue is full; dropped update for {description}.");
+                Log.Error($"[Statistics] PostgreSQL write queue is full; dropped update for {description}.");
         }
 
         private void ProcessWrites()
@@ -851,7 +851,7 @@ namespace SmokyPluginV2.Statistics
                 }
                 catch (Exception exception)
                 {
-                    Log.Error($"[Statistics] Failed to persist a queued MariaDB update:\n{exception}");
+                    Log.Error($"[Statistics] Failed to persist a queued PostgreSQL update:\n{exception}");
                 }
             }
         }
@@ -863,7 +863,7 @@ namespace SmokyPluginV2.Statistics
             player.IsConnected &&
             !player.IsHost &&
             !player.IsNPC &&
-            MariaDbService.IsSteamUserId(player.UserId);
+            PostgreSqlService.IsSteamUserId(player.UserId);
 
         private static long ElapsedSeconds(DateTime start, DateTime end) => Math.Max(0L, (long)Math.Round((end - start).TotalSeconds));
 

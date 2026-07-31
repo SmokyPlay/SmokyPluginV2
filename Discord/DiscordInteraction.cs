@@ -5,6 +5,8 @@ namespace SmokyPluginV2.Discord
         public ulong GuildId { get; set; }
 
         public ulong UserId { get; set; }
+
+        public ulong[] RoleIds { get; set; } = System.Array.Empty<ulong>();
     }
 
     internal sealed class DiscordInteraction
@@ -17,6 +19,8 @@ namespace SmokyPluginV2.Discord
 
         public ulong UserId { get; set; }
 
+        public ulong[] RoleIds { get; set; } = System.Array.Empty<ulong>();
+
         public ulong TargetDiscordUserId { get; set; }
 
         public string SteamId { get; set; }
@@ -24,6 +28,10 @@ namespace SmokyPluginV2.Discord
         public string StatisticsVisibility { get; set; }
 
         public string CommandName { get; set; }
+
+        public string CustomId { get; set; }
+
+        public bool IsComponent { get; set; }
     }
 
     internal sealed class DiscordInteractionResponse
@@ -32,7 +40,24 @@ namespace SmokyPluginV2.Discord
 
         public DiscordEmbed Embed { get; set; }
 
+        public DiscordActionRow[] Components { get; set; } = System.Array.Empty<DiscordActionRow>();
+
+        public bool UpdateMessage { get; set; }
+
         public bool Ephemeral { get; set; } = true;
+    }
+
+    internal sealed class DiscordActionRow
+    {
+        public DiscordButton[] Buttons { get; set; } = System.Array.Empty<DiscordButton>();
+    }
+
+    internal sealed class DiscordButton
+    {
+        public string CustomId { get; set; }
+        public string Label { get; set; }
+        public int Style { get; set; } = 2;
+        public bool Disabled { get; set; }
     }
 
     internal sealed class DiscordEmbed

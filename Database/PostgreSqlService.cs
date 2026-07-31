@@ -10,14 +10,14 @@ namespace SmokyPluginV2.Database
 
     using Exiled.API.Features;
 
-    using MySql.Data.MySqlClient;
+    using Npgsql;
 
     using SmokyPluginV2.AccountLinks;
     using SmokyPluginV2.Referrals;
     using SmokyPluginV2.Statistics;
-    using SmokyPluginV2.Warnings;
+    using SmokyPluginV2.Moderation;
 
-    internal sealed class MariaDbService : IDisposable
+    internal sealed class PostgreSqlService : IDisposable
     {
         private const int CommandTimeoutSeconds = 10;
 
@@ -42,26 +42,25 @@ namespace SmokyPluginV2.Database
 
         private readonly string connectionString;
         private readonly SharedDatabaseSettings settings;
-        private readonly string serverName;
+        private string serverName;
 
-        public MariaDbService(SharedDatabaseSettings settings, string serverName)
+        public PostgreSqlService(SharedDatabaseSettings settings, string serverName)
         {
             this.settings = settings ?? throw new ArgumentNullException(nameof(settings));
             this.serverName = serverName;
             if (string.IsNullOrWhiteSpace(settings.Host) || string.IsNullOrWhiteSpace(settings.Name) || string.IsNullOrWhiteSpace(settings.Username))
                 throw new InvalidOperationException("host, name and username in the shared database.yml must not be empty.");
-            MySqlConnectionStringBuilder builder = new MySqlConnectionStringBuilder
+            NpgsqlConnectionStringBuilder builder = new NpgsqlConnectionStringBuilder
             {
-                Server = settings.Host.Trim(),
+                Host = settings.Host.Trim(),
                 Port = settings.Port,
                 Database = settings.Name.Trim(),
-                UserID = settings.Username.Trim(),
+                Username = settings.Username.Trim(),
                 Password = settings.Password ?? string.Empty,
-                ConnectionTimeout = Math.Max(1u, settings.ConnectionTimeoutSeconds),
-                MaximumPoolSize = Math.Max(2u, settings.MaximumPoolSize),
+                Timeout = (int)Math.Max(1u, settings.ConnectionTimeoutSeconds),
+                MaxPoolSize = (int)Math.Max(2u, settings.MaximumPoolSize),
                 Pooling = true,
-                CharacterSet = "utf8mb4",
-                SslMode = settings.UseTls ? MySqlSslMode.Required : MySqlSslMode.None,
+                SslMode = settings.UseTls ? SslMode.Require : SslMode.Disable,
             };
             connectionString = builder.ConnectionString;
 
@@ -69,7 +68,7 @@ namespace SmokyPluginV2.Database
             ServerId = ResolveServer();
             EnsureServerStatisticsRow();
             IsAvailable = true;
-            Log.Info($"[Database] MariaDB connected. Game port {Server.Port} has server id {ServerId}.");
+            Log.Info($"[Database] PostgreSQL connected. Game port {Server.Port} has server id {ServerId}.");
         }
 
         public bool IsAvailable { get; private set; }
@@ -77,6 +76,44 @@ namespace SmokyPluginV2.Database
         public long ServerId { get; private set; }
 
         public string ServerName => string.IsNullOrWhiteSpace(serverName) ? "Server " + Server.Port : serverName.Trim();
+
+        public bool TryUpdateServerName(string reloadedServerName, out string error)
+        {
+            string normalized = string.IsNullOrWhiteSpace(reloadedServerName)
+                ? "Server " + Server.Port
+                : reloadedServerName.Trim();
+            if (normalized.Length > 128)
+            {
+                error = "Название сервера не может быть длиннее 128 символов.";
+                return false;
+            }
+
+            try
+            {
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
+                    "UPDATE servers SET display_name=@display_name,updated_at=CURRENT_TIMESTAMP " +
+                    "WHERE id=@server_id AND game_port=@game_port"))
+                {
+                    command.Parameters.AddWithValue("@display_name", normalized);
+                    command.Parameters.AddWithValue("@server_id", ServerId);
+                    command.Parameters.AddWithValue("@game_port", (int)Server.Port);
+                    if (command.ExecuteNonQuery() != 1)
+                    {
+                        error = $"Запись сервера с ID {ServerId} и портом {Server.Port} не найдена.";
+                        return false;
+                    }
+                }
+
+                serverName = reloadedServerName;
+                error = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                return Fail("server name update", exception, out error);
+            }
+        }
 
         public void Dispose()
         {
@@ -88,8 +125,8 @@ namespace SmokyPluginV2.Database
             discordUserId = 0;
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlCommand command = CreateCommand(connection,
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
                     "SELECT al.discord_user_id FROM account_links al JOIN players p ON p.id=al.player_id WHERE p.steam_id=@steam_id LIMIT 1"))
                 {
                     command.Parameters.AddWithValue("@steam_id", NormalizeSteamId(playerUserId));
@@ -119,12 +156,12 @@ namespace SmokyPluginV2.Database
             discordUserId = 0;
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
                 {
                     playerId = GetOrCreatePlayerId(connection, transaction, playerUserId, null);
                     resolvedPlayerUserId = ToExiledUserId(NormalizeSteamId(playerUserId));
-                    using (MySqlCommand link = CreateCommand(connection,
+                    using (NpgsqlCommand link = CreateCommand(connection,
                         "SELECT discord_user_id FROM account_links WHERE player_id=@player_id LIMIT 1", transaction))
                     {
                         link.Parameters.AddWithValue("@player_id", playerId);
@@ -155,18 +192,18 @@ namespace SmokyPluginV2.Database
             playerUserId = null;
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlCommand command = CreateCommand(connection,
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
                     "SELECT p.id,p.steam_id FROM account_links al " +
                     "JOIN players p ON p.id=al.player_id WHERE al.discord_user_id=@discord_id LIMIT 1"))
                 {
                     command.Parameters.AddWithValue("@discord_id", discordUserId.ToString(CultureInfo.InvariantCulture));
-                    using (MySqlDataReader reader = command.ExecuteReader())
+                    using (NpgsqlDataReader reader = command.ExecuteReader())
                     {
                         if (reader.Read())
                         {
-                            playerId = reader.GetInt64("id");
-                            playerUserId = ToExiledUserId(reader.GetString("steam_id"));
+                            playerId = GetInt64(reader, "id");
+                            playerUserId = ToExiledUserId(GetString(reader, "steam_id"));
                         }
                     }
                 }
@@ -185,8 +222,8 @@ namespace SmokyPluginV2.Database
             totalPlaytimeSeconds = 0;
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlCommand command = CreateCommand(connection,
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
                     "SELECT COALESCE(human_seconds,0)+COALESCE(scp_seconds,0)+COALESCE(spectator_seconds,0) " +
                     "FROM player_statistics WHERE server_id=@server_id AND player_id=@player_id LIMIT 1"))
                 {
@@ -216,8 +253,8 @@ namespace SmokyPluginV2.Database
             state = new ReferralAccessState();
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlCommand command = CreateCommand(connection,
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
                     "SELECT " +
                     "(SELECT COUNT(*) FROM referrals r WHERE r.inviter_player_id=@player_id AND " +
                     "(SELECT COALESCE(SUM(COALESCE(ps.human_seconds,0)+COALESCE(ps.scp_seconds,0)+COALESCE(ps.spectator_seconds,0)),0) " +
@@ -228,7 +265,7 @@ namespace SmokyPluginV2.Database
                 {
                     command.Parameters.AddWithValue("@player_id", playerId);
                     command.Parameters.AddWithValue("@required_seconds", Math.Max(1, qualificationSeconds));
-                    using (MySqlDataReader reader = command.ExecuteReader())
+                    using (NpgsqlDataReader reader = command.ExecuteReader())
                     {
                         if (reader.Read())
                         {
@@ -261,8 +298,8 @@ namespace SmokyPluginV2.Database
             isPending = false;
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlCommand command = CreateCommand(connection,
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
                     "SELECT EXISTS(SELECT 1 FROM referrals r " +
                     "JOIN players p ON p.id=r.invited_player_id " +
                     "WHERE p.steam_id=@steam_id AND " +
@@ -300,15 +337,15 @@ namespace SmokyPluginV2.Database
 
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
                 {
                     long invitedPlayerId = GetOrCreatePlayerId(
                         connection,
                         transaction,
                         invitedPlayerUserId,
                         null);
-                    using (MySqlCommand lockInvited = CreateCommand(connection,
+                    using (NpgsqlCommand lockInvited = CreateCommand(connection,
                         "SELECT id FROM players WHERE id=@player_id FOR UPDATE",
                         transaction))
                     {
@@ -316,7 +353,7 @@ namespace SmokyPluginV2.Database
                         lockInvited.ExecuteScalar();
                     }
 
-                    using (MySqlCommand existing = CreateCommand(connection,
+                    using (NpgsqlCommand existing = CreateCommand(connection,
                         "SELECT 1 FROM referrals WHERE invited_player_id=@player_id LIMIT 1",
                         transaction))
                     {
@@ -342,7 +379,7 @@ namespace SmokyPluginV2.Database
                     }
 
                     long inviterPlayerId;
-                    using (MySqlCommand inviter = CreateCommand(connection,
+                    using (NpgsqlCommand inviter = CreateCommand(connection,
                         "SELECT id FROM players WHERE referral_code=@code LIMIT 1 FOR UPDATE",
                         transaction))
                     {
@@ -363,7 +400,7 @@ namespace SmokyPluginV2.Database
                         return false;
                     }
 
-                    using (MySqlCommand insert = CreateCommand(connection,
+                    using (NpgsqlCommand insert = CreateCommand(connection,
                         "INSERT INTO referrals(invited_player_id,inviter_player_id,accepted_at) " +
                         "VALUES(@invited_player_id,@inviter_player_id,@accepted_at)",
                         transaction))
@@ -395,13 +432,13 @@ namespace SmokyPluginV2.Database
             status = null;
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
                 {
                     long playerId;
                     string playerUserId;
                     string referralCode;
-                    using (MySqlCommand player = CreateCommand(connection,
+                    using (NpgsqlCommand player = CreateCommand(connection,
                         "SELECT p.id,p.steam_id,p.referral_code FROM account_links al " +
                         "JOIN players p ON p.id=al.player_id WHERE al.discord_user_id=@discord_id LIMIT 1 FOR UPDATE",
                         transaction))
@@ -409,7 +446,7 @@ namespace SmokyPluginV2.Database
                         player.Parameters.AddWithValue(
                             "@discord_id",
                             discordUserId.ToString(CultureInfo.InvariantCulture));
-                        using (MySqlDataReader reader = player.ExecuteReader())
+                        using (NpgsqlDataReader reader = player.ExecuteReader())
                         {
                             if (!reader.Read())
                             {
@@ -417,11 +454,11 @@ namespace SmokyPluginV2.Database
                                 return false;
                             }
 
-                            playerId = reader.GetInt64("id");
-                            playerUserId = ToExiledUserId(reader.GetString("steam_id"));
+                            playerId = GetInt64(reader, "id");
+                            playerUserId = ToExiledUserId(GetString(reader, "steam_id"));
                             referralCode = reader.IsDBNull(reader.GetOrdinal("referral_code"))
                                 ? null
-                                : reader.GetString("referral_code");
+                                : GetString(reader, "referral_code");
                         }
                     }
 
@@ -429,7 +466,7 @@ namespace SmokyPluginV2.Database
                         referralCode = CreateReferralCode(connection, transaction, playerId);
 
                     List<ReferralParticipant> participants = new List<ReferralParticipant>();
-                    using (MySqlCommand referrals = CreateCommand(connection,
+                    using (NpgsqlCommand referrals = CreateCommand(connection,
                         "SELECT p.steam_id,p.last_nickname,r.accepted_at," +
                         "COALESCE(SUM(COALESCE(ps.human_seconds,0)+COALESCE(ps.scp_seconds,0)+COALESCE(ps.spectator_seconds,0)),0) AS total_seconds " +
                         "FROM referrals r JOIN players p ON p.id=r.invited_player_id " +
@@ -440,18 +477,18 @@ namespace SmokyPluginV2.Database
                         transaction))
                     {
                         referrals.Parameters.AddWithValue("@player_id", playerId);
-                        using (MySqlDataReader reader = referrals.ExecuteReader())
+                        using (NpgsqlDataReader reader = referrals.ExecuteReader())
                         {
                             while (reader.Read())
                             {
                                 participants.Add(new ReferralParticipant
                                 {
-                                    PlayerUserId = ToExiledUserId(reader.GetString("steam_id")),
+                                    PlayerUserId = ToExiledUserId(GetString(reader, "steam_id")),
                                     Nickname = reader.IsDBNull(reader.GetOrdinal("last_nickname"))
                                         ? null
-                                        : reader.GetString("last_nickname"),
+                                        : GetString(reader, "last_nickname"),
                                     AcceptedAtUtc = DateTime.SpecifyKind(
-                                        reader.GetDateTime("accepted_at"),
+                                        GetDateTime(reader, "accepted_at"),
                                         DateTimeKind.Utc),
                                     TotalPlaytimeSeconds = Convert.ToInt64(
                                         reader["total_seconds"],
@@ -491,12 +528,12 @@ namespace SmokyPluginV2.Database
             transition = null;
             try
             {
-                using (MySqlConnection connection = OpenConnection())
+                using (NpgsqlConnection connection = OpenConnection())
                 {
                     long invitedPlayerId;
                     long inviterPlayerId;
                     string inviterSteamId;
-                    using (MySqlCommand relation = CreateCommand(connection,
+                    using (NpgsqlCommand relation = CreateCommand(connection,
                         "SELECT invited.id AS invited_id,inviter.id AS inviter_id,inviter.steam_id AS inviter_steam_id " +
                         "FROM referrals r JOIN players invited ON invited.id=r.invited_player_id " +
                         "JOIN players inviter ON inviter.id=r.inviter_player_id " +
@@ -505,7 +542,7 @@ namespace SmokyPluginV2.Database
                         relation.Parameters.AddWithValue(
                             "@steam_id",
                             NormalizeSteamId(invitedPlayerUserId));
-                        using (MySqlDataReader reader = relation.ExecuteReader())
+                        using (NpgsqlDataReader reader = relation.ExecuteReader())
                         {
                             if (!reader.Read())
                             {
@@ -513,9 +550,9 @@ namespace SmokyPluginV2.Database
                                 return true;
                             }
 
-                            invitedPlayerId = reader.GetInt64("invited_id");
-                            inviterPlayerId = reader.GetInt64("inviter_id");
-                            inviterSteamId = ToExiledUserId(reader.GetString("inviter_steam_id"));
+                            invitedPlayerId = GetInt64(reader, "invited_id");
+                            inviterPlayerId = GetInt64(reader, "inviter_id");
+                            inviterSteamId = ToExiledUserId(GetString(reader, "inviter_steam_id"));
                         }
                     }
 
@@ -533,7 +570,7 @@ namespace SmokyPluginV2.Database
                     }
 
                     int qualifiedCount;
-                    using (MySqlCommand qualified = CreateCommand(connection,
+                    using (NpgsqlCommand qualified = CreateCommand(connection,
                         "SELECT COUNT(*) FROM referrals r WHERE r.inviter_player_id=@inviter_id AND " +
                         "(SELECT COALESCE(SUM(COALESCE(ps.human_seconds,0)+COALESCE(ps.scp_seconds,0)+COALESCE(ps.spectator_seconds,0)),0) " +
                         "FROM player_statistics ps WHERE ps.player_id=r.invited_player_id)>=@required_seconds"))
@@ -568,8 +605,8 @@ namespace SmokyPluginV2.Database
             playerUserId = null;
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlCommand command = CreateCommand(connection,
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
                     "SELECT p.steam_id FROM account_links al JOIN players p ON p.id=al.player_id WHERE al.discord_user_id=@discord_id LIMIT 1"))
                 {
                     command.Parameters.AddWithValue("@discord_id", discordUserId.ToString(CultureInfo.InvariantCulture));
@@ -592,18 +629,18 @@ namespace SmokyPluginV2.Database
             accountLinked = false;
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlCommand command = CreateCommand(connection,
-                    "UPDATE players p JOIN account_links al ON al.player_id=p.id " +
-                    "SET p.statistics_private=@is_private WHERE al.discord_user_id=@discord_id"))
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
+                    "UPDATE players p SET statistics_private=@is_private,updated_at=CURRENT_TIMESTAMP " +
+                    "FROM account_links al WHERE al.player_id=p.id AND al.discord_user_id=@discord_id"))
                 {
                     command.Parameters.AddWithValue("@is_private", isPrivate);
                     command.Parameters.AddWithValue("@discord_id", discordUserId.ToString(CultureInfo.InvariantCulture));
                     command.ExecuteNonQuery();
                 }
 
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlCommand command = CreateCommand(connection,
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
                     "SELECT 1 FROM account_links WHERE discord_user_id=@discord_id LIMIT 1"))
                 {
                     command.Parameters.AddWithValue("@discord_id", discordUserId.ToString(CultureInfo.InvariantCulture));
@@ -623,11 +660,11 @@ namespace SmokyPluginV2.Database
         {
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
                 {
                     long playerId = GetOrCreatePlayerId(connection, transaction, playerUserId, null);
-                    using (MySqlCommand command = CreateCommand(connection,
+                    using (NpgsqlCommand command = CreateCommand(connection,
                         "INSERT INTO account_links(player_id,discord_user_id,linked_at) VALUES(@player_id,@discord_id,@linked_at)", transaction))
                     {
                         command.Parameters.AddWithValue("@player_id", playerId);
@@ -642,7 +679,7 @@ namespace SmokyPluginV2.Database
                 error = null;
                 return true;
             }
-            catch (MySqlException exception) when (exception.Number == 1062)
+            catch (PostgresException exception) when (exception.SqlState == "23505")
             {
                 error = "Этот Steam или Discord аккаунт уже связан с другим аккаунтом.";
                 return false;
@@ -658,9 +695,9 @@ namespace SmokyPluginV2.Database
             discordUserId = 0;
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
-                using (MySqlCommand lookup = CreateCommand(connection,
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
+                using (NpgsqlCommand lookup = CreateCommand(connection,
                     "SELECT al.discord_user_id FROM account_links al JOIN players p ON p.id=al.player_id WHERE p.steam_id=@steam_id FOR UPDATE", transaction))
                 {
                     lookup.Parameters.AddWithValue("@steam_id", NormalizeSteamId(playerUserId));
@@ -672,8 +709,8 @@ namespace SmokyPluginV2.Database
                     }
 
                     discordUserId = ulong.Parse(Convert.ToString(result, CultureInfo.InvariantCulture), CultureInfo.InvariantCulture);
-                    using (MySqlCommand delete = CreateCommand(connection,
-                        "DELETE al FROM account_links al JOIN players p ON p.id=al.player_id WHERE p.steam_id=@steam_id", transaction))
+                    using (NpgsqlCommand delete = CreateCommand(connection,
+                        "DELETE FROM account_links al USING players p WHERE p.id=al.player_id AND p.steam_id=@steam_id", transaction))
                     {
                         delete.Parameters.AddWithValue("@steam_id", NormalizeSteamId(playerUserId));
                         delete.ExecuteNonQuery();
@@ -696,9 +733,9 @@ namespace SmokyPluginV2.Database
             playerUserId = null;
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
-                using (MySqlCommand lookup = CreateCommand(connection,
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
+                using (NpgsqlCommand lookup = CreateCommand(connection,
                     "SELECT p.steam_id FROM account_links al JOIN players p ON p.id=al.player_id WHERE al.discord_user_id=@discord_id FOR UPDATE", transaction))
                 {
                     lookup.Parameters.AddWithValue("@discord_id", discordUserId.ToString(CultureInfo.InvariantCulture));
@@ -710,7 +747,7 @@ namespace SmokyPluginV2.Database
                     }
 
                     playerUserId = ToExiledUserId(Convert.ToString(result, CultureInfo.InvariantCulture));
-                    using (MySqlCommand delete = CreateCommand(connection,
+                    using (NpgsqlCommand delete = CreateCommand(connection,
                         "DELETE FROM account_links WHERE discord_user_id=@discord_id", transaction))
                     {
                         delete.Parameters.AddWithValue("@discord_id", discordUserId.ToString(CultureInfo.InvariantCulture));
@@ -729,29 +766,21 @@ namespace SmokyPluginV2.Database
             }
         }
 
-        public bool TryAddWarning(WarningRecord warning, out string error)
+        public bool TryAddPunishment(PunishmentRecord punishment, out string error)
         {
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlTransaction transaction = connection.BeginTransaction(IsolationLevel.Serializable))
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
                 {
-                    long playerId = GetOrCreatePlayerId(connection, transaction, warning.PlayerUserId, warning.PlayerNickname);
-                    using (MySqlCommand next = CreateCommand(connection,
-                        "SELECT next_id FROM warning_sequences WHERE server_id=@server_id FOR UPDATE", transaction))
+                    long playerId = GetOrCreatePlayerId(connection, transaction, punishment.PlayerUserId, punishment.PlayerNickname);
+                    using (NpgsqlCommand command = CreateCommand(connection,
+                        "INSERT INTO punishments(server_id,player_id,moderator_user_id,type,reason,issued_at,expires_at,notified_at) " +
+                        "VALUES(@server_id,@player_id,@moderator_user_id,@type,@reason,@issued_at,@expires_at,@notified_at) RETURNING id", transaction))
                     {
-                        next.Parameters.AddWithValue("@server_id", ServerId);
-                        warning.Id = Convert.ToInt64(next.ExecuteScalar(), CultureInfo.InvariantCulture);
+                        AddPunishmentParameters(command, punishment, playerId);
+                        punishment.Id = Convert.ToInt64(command.ExecuteScalar(), CultureInfo.InvariantCulture);
                     }
-
-                    using (MySqlCommand advance = CreateCommand(connection,
-                        "UPDATE warning_sequences SET next_id=next_id+1 WHERE server_id=@server_id", transaction))
-                    {
-                        advance.Parameters.AddWithValue("@server_id", ServerId);
-                        advance.ExecuteNonQuery();
-                    }
-
-                    InsertWarning(connection, transaction, warning, playerId);
                     transaction.Commit();
                 }
 
@@ -760,89 +789,124 @@ namespace SmokyPluginV2.Database
             }
             catch (Exception exception)
             {
-                return Fail("warning insertion", exception, out error);
+                return Fail("punishment insertion", exception, out error);
             }
         }
 
-        public bool TryGetWarning(long warningId, out WarningRecord warning, out string error)
+        public bool TryGetPunishment(long id, out PunishmentRecord punishment, out string error)
         {
-            warning = null;
+            punishment = null;
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlCommand command = CreateCommand(connection, WarningSelect + " WHERE w.server_id=@server_id AND w.id=@id"))
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection, PunishmentSelect + " WHERE pu.server_id=@server_id AND pu.id=@id"))
                 {
                     command.Parameters.AddWithValue("@server_id", ServerId);
-                    command.Parameters.AddWithValue("@id", warningId);
-                    using (MySqlDataReader reader = command.ExecuteReader())
-                    {
-                        if (reader.Read())
-                            warning = ReadWarning(reader);
-                    }
+                    command.Parameters.AddWithValue("@id", id);
+                    using (NpgsqlDataReader reader = command.ExecuteReader())
+                        if (reader.Read()) punishment = ReadPunishment(reader);
                 }
-
                 error = null;
                 return true;
             }
-            catch (Exception exception)
-            {
-                return Fail("warning lookup", exception, out error);
-            }
+            catch (Exception exception) { return Fail("punishment lookup", exception, out error); }
         }
 
-        public bool TryGetWarnings(string playerUserId, out IReadOnlyList<WarningRecord> warnings, out string error)
+        public bool TryGetPunishmentHistory(string playerUserId, out PunishmentHistory history, out string error)
         {
-            List<WarningRecord> result = new List<WarningRecord>();
+            history = null;
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlCommand command = CreateCommand(connection, WarningSelect +
-                    " WHERE w.server_id=@server_id AND p.steam_id=@steam_id ORDER BY w.id DESC"))
+                List<PunishmentRecord> records = new List<PunishmentRecord>();
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection, PunishmentSelect +
+                    " WHERE pu.server_id=@server_id AND p.steam_id=@steam_id ORDER BY pu.id DESC"))
                 {
                     command.Parameters.AddWithValue("@server_id", ServerId);
                     command.Parameters.AddWithValue("@steam_id", NormalizeSteamId(playerUserId));
-                    using (MySqlDataReader reader = command.ExecuteReader())
+                    using (NpgsqlDataReader reader = command.ExecuteReader())
+                        while (reader.Read()) records.Add(ReadPunishment(reader));
+                }
+                PunishmentRecord first = records.FirstOrDefault();
+                bool playerExists = first != null;
+                string nickname = first?.PlayerNickname ?? string.Empty;
+                ulong discordUserId = first?.DiscordUserId ?? 0;
+                if (first == null)
+                {
+                    using (NpgsqlConnection connection = OpenConnection())
+                    using (NpgsqlCommand profile = CreateCommand(connection,
+                        "SELECT p.last_nickname,COALESCE(al.discord_user_id,'') AS discord_user_id FROM players p " +
+                        "LEFT JOIN account_links al ON al.player_id=p.id WHERE p.steam_id=@steam_id"))
                     {
-                        while (reader.Read())
-                            result.Add(ReadWarning(reader));
+                        profile.Parameters.AddWithValue("@steam_id", NormalizeSteamId(playerUserId));
+                        using (NpgsqlDataReader reader = profile.ExecuteReader())
+                        {
+                            if (reader.Read())
+                            {
+                                playerExists = true;
+                                nickname = reader["last_nickname"] == DBNull.Value ? string.Empty : GetString(reader, "last_nickname");
+                                ulong.TryParse(GetString(reader, "discord_user_id"), NumberStyles.None, CultureInfo.InvariantCulture, out discordUserId);
+                            }
+                        }
                     }
                 }
+                history = new PunishmentHistory
+                {
+                    PlayerExists = playerExists,
+                    PlayerUserId = ToExiledUserId(NormalizeSteamId(playerUserId)),
+                    PlayerNickname = nickname,
+                    DiscordUserId = discordUserId,
+                    Records = records,
+                };
+                error = null;
+                return true;
+            }
+            catch (Exception exception) { return Fail("punishment history lookup", exception, out error); }
+        }
 
-                warnings = result;
+        public bool TryGetPendingWarningNotifications(
+            string playerUserId,
+            out IReadOnlyList<PunishmentRecord> records,
+            out string error)
+        {
+            List<PunishmentRecord> result = new List<PunishmentRecord>();
+            try
+            {
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection, PunishmentSelect +
+                    " WHERE pu.server_id=@server_id AND p.steam_id=@steam_id " +
+                    "AND pu.type='warning' AND pu.notified_at IS NULL ORDER BY pu.id ASC"))
+                {
+                    command.Parameters.AddWithValue("@server_id", ServerId);
+                    command.Parameters.AddWithValue("@steam_id", NormalizeSteamId(playerUserId));
+                    using (NpgsqlDataReader reader = command.ExecuteReader())
+                        while (reader.Read()) result.Add(ReadPunishment(reader));
+                }
+
+                records = result;
                 error = null;
                 return true;
             }
             catch (Exception exception)
             {
-                warnings = Array.Empty<WarningRecord>();
-                return Fail("warnings lookup", exception, out error);
+                records = Array.Empty<PunishmentRecord>();
+                return Fail("pending warning notification lookup", exception, out error);
             }
         }
 
-        public bool TryDeleteWarning(long warningId, out WarningRecord warning, out string error)
+        public bool TryMarkPunishmentNotified(long id, DateTime notifiedAtUtc, out string error)
         {
-            warning = null;
             try
             {
-                if (!TryGetWarning(warningId, out warning, out error))
-                    return false;
-                if (warning == null)
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
+                    "UPDATE punishments SET notified_at=@notified_at WHERE server_id=@server_id " +
+                    "AND id=@id AND type='warning' AND notified_at IS NULL"))
                 {
-                    error = $"Предупреждение #{warningId} не найдено.";
-                    return false;
-                }
-
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlCommand command = CreateCommand(connection, "DELETE FROM warnings WHERE server_id=@server_id AND id=@id"))
-                {
+                    command.Parameters.AddWithValue("@notified_at", notifiedAtUtc);
                     command.Parameters.AddWithValue("@server_id", ServerId);
-                    command.Parameters.AddWithValue("@id", warningId);
-                    if (command.ExecuteNonQuery() != 1)
-                    {
-                        warning = null;
-                        error = $"Предупреждение #{warningId} уже удалено.";
-                        return false;
-                    }
+                    command.Parameters.AddWithValue("@id", id);
+                    command.ExecuteNonQuery();
                 }
 
                 error = null;
@@ -850,9 +914,49 @@ namespace SmokyPluginV2.Database
             }
             catch (Exception exception)
             {
-                warning = null;
-                return Fail("warning deletion", exception, out error);
+                return Fail("warning notification update", exception, out error);
             }
+        }
+
+        public bool TryDeletePunishment(long id, out PunishmentRecord punishment, out string error)
+        {
+            punishment = null;
+            try
+            {
+                if (!TryGetPunishment(id, out punishment, out error)) return false;
+                if (punishment == null) { error = $"Наказание #{id} не найдено."; return false; }
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection, "DELETE FROM punishments WHERE server_id=@server_id AND id=@id"))
+                {
+                    command.Parameters.AddWithValue("@server_id", ServerId);
+                    command.Parameters.AddWithValue("@id", id);
+                    if (command.ExecuteNonQuery() != 1) { punishment = null; error = $"Наказание #{id} уже удалено."; return false; }
+                }
+                error = null;
+                return true;
+            }
+            catch (Exception exception) { punishment = null; return Fail("punishment deletion", exception, out error); }
+        }
+
+        public bool TryDeleteActiveBans(string playerUserId, DateTime nowUtc, out int deleted, out string error)
+        {
+            deleted = 0;
+            try
+            {
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
+                    "DELETE FROM punishments pu USING players p WHERE pu.player_id=p.id AND pu.server_id=@server_id " +
+                    "AND p.steam_id=@steam_id AND pu.type='ban' AND (pu.expires_at IS NULL OR pu.expires_at>@now)"))
+                {
+                    command.Parameters.AddWithValue("@server_id", ServerId);
+                    command.Parameters.AddWithValue("@steam_id", NormalizeSteamId(playerUserId));
+                    command.Parameters.AddWithValue("@now", nowUtc);
+                    deleted = command.ExecuteNonQuery();
+                }
+                error = null;
+                return true;
+            }
+            catch (Exception exception) { return Fail("active ban history deletion", exception, out error); }
         }
 
         public void UpdatePlayerStatistics(string playerUserId, string nickname, PlayerStatDelta delta, DateTime seenAtUtc)
@@ -863,38 +967,39 @@ namespace SmokyPluginV2.Database
             delta = delta ?? new PlayerStatDelta();
             ValidateColumns(delta.Add.Keys.Concat(delta.Maximum.Keys).Concat(delta.MinimumNullable.Keys), PlayerColumns);
 
-            using (MySqlConnection connection = OpenConnection())
-            using (MySqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
+            using (NpgsqlConnection connection = OpenConnection())
+            using (NpgsqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
             {
                 long playerId = GetOrCreatePlayerId(connection, transaction, playerUserId, nickname);
                 List<string> columns = new List<string> { "server_id", "player_id", "last_seen" };
                 List<string> values = new List<string> { "@server_id", "@player_id", "@last_seen" };
-                List<string> updates = new List<string> { "last_seen=VALUES(last_seen)" };
+                List<string> updates = new List<string> { "last_seen=EXCLUDED.last_seen" };
 
                 foreach (KeyValuePair<string, long> pair in delta.Add)
                 {
                     columns.Add(pair.Key);
                     values.Add("@" + pair.Key);
-                    updates.Add(pair.Key + "=" + pair.Key + "+VALUES(" + pair.Key + ")");
+                    updates.Add(pair.Key + "=player_statistics." + pair.Key + "+EXCLUDED." + pair.Key);
                 }
 
                 foreach (KeyValuePair<string, long> pair in delta.Maximum)
                 {
                     columns.Add(pair.Key);
                     values.Add("@" + pair.Key);
-                    updates.Add(pair.Key + "=GREATEST(" + pair.Key + ",VALUES(" + pair.Key + "))");
+                    updates.Add(pair.Key + "=GREATEST(player_statistics." + pair.Key + ",EXCLUDED." + pair.Key + ")");
                 }
 
                 foreach (KeyValuePair<string, long> pair in delta.MinimumNullable)
                 {
                     columns.Add(pair.Key);
                     values.Add("@" + pair.Key);
-                    updates.Add(pair.Key + "=IF(" + pair.Key + " IS NULL,VALUES(" + pair.Key + "),LEAST(" + pair.Key + ",VALUES(" + pair.Key + ")))");
+                    updates.Add(pair.Key + "=CASE WHEN player_statistics." + pair.Key + " IS NULL THEN EXCLUDED." + pair.Key +
+                        " ELSE LEAST(player_statistics." + pair.Key + ",EXCLUDED." + pair.Key + ") END");
                 }
 
                 string sql = "INSERT INTO player_statistics(" + string.Join(",", columns) + ") VALUES(" + string.Join(",", values) +
-                    ") ON DUPLICATE KEY UPDATE " + string.Join(",", updates);
-                using (MySqlCommand command = CreateCommand(connection, sql, transaction))
+                    ") ON CONFLICT(server_id,player_id) DO UPDATE SET " + string.Join(",", updates);
+                using (NpgsqlCommand command = CreateCommand(connection, sql, transaction))
                 {
                     command.Parameters.AddWithValue("@server_id", ServerId);
                     command.Parameters.AddWithValue("@player_id", playerId);
@@ -919,21 +1024,21 @@ namespace SmokyPluginV2.Database
             {
                 columns.Add(pair.Key);
                 values.Add("@" + pair.Key);
-                updates.Add(pair.Key + "=" + pair.Key + "+VALUES(" + pair.Key + ")");
+                updates.Add(pair.Key + "=server_statistics." + pair.Key + "+EXCLUDED." + pair.Key);
             }
             foreach (KeyValuePair<string, long> pair in delta.Maximum)
             {
                 columns.Add(pair.Key);
                 values.Add("@" + pair.Key);
-                updates.Add(pair.Key + "=GREATEST(" + pair.Key + ",VALUES(" + pair.Key + "))");
+                updates.Add(pair.Key + "=GREATEST(server_statistics." + pair.Key + ",EXCLUDED." + pair.Key + ")");
             }
             if (updates.Count == 0)
                 return;
 
-            using (MySqlConnection connection = OpenConnection())
-            using (MySqlCommand command = CreateCommand(connection,
+            using (NpgsqlConnection connection = OpenConnection())
+            using (NpgsqlCommand command = CreateCommand(connection,
                 "INSERT INTO server_statistics(" + string.Join(",", columns) + ") VALUES(" + string.Join(",", values) +
-                ") ON DUPLICATE KEY UPDATE " + string.Join(",", updates)))
+                ") ON CONFLICT(server_id) DO UPDATE SET " + string.Join(",", updates)))
             {
                 command.Parameters.AddWithValue("@server_id", ServerId);
                 foreach (KeyValuePair<string, long> pair in delta.Add.Concat(delta.Maximum))
@@ -947,13 +1052,13 @@ namespace SmokyPluginV2.Database
             record = null;
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlCommand command = CreateCommand(connection,
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
                     "SELECT p.steam_id,p.last_nickname,p.statistics_private,ps.* FROM players p LEFT JOIN player_statistics ps ON ps.player_id=p.id AND ps.server_id=@server_id WHERE p.steam_id=@steam_id LIMIT 1"))
                 {
                     command.Parameters.AddWithValue("@server_id", ServerId);
                     command.Parameters.AddWithValue("@steam_id", NormalizeSteamId(playerUserId));
-                    using (MySqlDataReader reader = command.ExecuteReader())
+                    using (NpgsqlDataReader reader = command.ExecuteReader())
                     {
                         if (reader.Read() && !reader.IsDBNull(reader.GetOrdinal("server_id")))
                             record = ReadPlayerStatistics(reader);
@@ -974,10 +1079,10 @@ namespace SmokyPluginV2.Database
             existed = false;
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlCommand command = CreateCommand(connection,
-                    "DELETE ps FROM player_statistics ps JOIN players p ON p.id=ps.player_id " +
-                    "WHERE ps.server_id=@server_id AND p.steam_id=@steam_id"))
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
+                    "DELETE FROM player_statistics ps USING players p WHERE p.id=ps.player_id " +
+                    "AND ps.server_id=@server_id AND p.steam_id=@steam_id"))
                 {
                     command.Parameters.AddWithValue("@server_id", ServerId);
                     command.Parameters.AddWithValue("@steam_id", NormalizeSteamId(playerUserId));
@@ -998,12 +1103,12 @@ namespace SmokyPluginV2.Database
             record = null;
             try
             {
-                using (MySqlConnection connection = OpenConnection())
-                using (MySqlCommand command = CreateCommand(connection,
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
                     "SELECT s.display_name,ss.* FROM servers s JOIN server_statistics ss ON ss.server_id=s.id WHERE s.id=@server_id"))
                 {
                     command.Parameters.AddWithValue("@server_id", ServerId);
-                    using (MySqlDataReader reader = command.ExecuteReader())
+                    using (NpgsqlDataReader reader = command.ExecuteReader())
                     {
                         if (reader.Read())
                             record = ReadServerStatistics(reader);
@@ -1021,8 +1126,8 @@ namespace SmokyPluginV2.Database
 
         public void ImportLegacyAccountLinks(string importKey, IEnumerable<AccountLinkRecord> links)
         {
-            using (MySqlConnection connection = OpenConnection())
-            using (MySqlTransaction transaction = connection.BeginTransaction(IsolationLevel.Serializable))
+            using (NpgsqlConnection connection = OpenConnection())
+            using (NpgsqlTransaction transaction = connection.BeginTransaction(IsolationLevel.Serializable))
             {
                 if (LegacyImportExists(connection, transaction, importKey))
                     return;
@@ -1033,8 +1138,8 @@ namespace SmokyPluginV2.Database
                     if (string.IsNullOrWhiteSpace(link.PlayerUserId) || link.DiscordUserId == 0)
                         continue;
                     long playerId = GetOrCreatePlayerId(connection, transaction, link.PlayerUserId, null);
-                    using (MySqlCommand command = CreateCommand(connection,
-                        "INSERT IGNORE INTO account_links(player_id,discord_user_id,linked_at) VALUES(@player_id,@discord_id,@linked_at)", transaction))
+                    using (NpgsqlCommand command = CreateCommand(connection,
+                        "INSERT INTO account_links(player_id,discord_user_id,linked_at) VALUES(@player_id,@discord_id,@linked_at) ON CONFLICT DO NOTHING", transaction))
                     {
                         command.Parameters.AddWithValue("@player_id", playerId);
                         command.Parameters.AddWithValue("@discord_id", link.DiscordUserId.ToString(CultureInfo.InvariantCulture));
@@ -1048,36 +1153,28 @@ namespace SmokyPluginV2.Database
             }
         }
 
-        public void ImportLegacyWarnings(string importKey, IEnumerable<WarningRecord> warnings)
+        public void ImportLegacyPunishments(string importKey, IEnumerable<PunishmentRecord> punishments)
         {
-            using (MySqlConnection connection = OpenConnection())
-            using (MySqlTransaction transaction = connection.BeginTransaction(IsolationLevel.Serializable))
+            using (NpgsqlConnection connection = OpenConnection())
+            using (NpgsqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
             {
-                if (LegacyImportExists(connection, transaction, importKey))
-                    return;
+                if (LegacyImportExists(connection, transaction, importKey)) return;
                 int imported = 0;
-                foreach (WarningRecord warning in warnings ?? Enumerable.Empty<WarningRecord>())
+                foreach (PunishmentRecord punishment in punishments ?? Enumerable.Empty<PunishmentRecord>())
                 {
-                    if (warning == null || warning.Id <= 0 || string.IsNullOrWhiteSpace(warning.PlayerUserId))
-                        continue;
-                    long playerId = GetOrCreatePlayerId(connection, transaction, warning.PlayerUserId, warning.PlayerNickname);
-                    using (MySqlCommand command = CreateCommand(connection,
-                        "INSERT IGNORE INTO warnings(server_id,id,player_id,player_nickname,moderator_user_id,moderator_nickname,issued_at,reason) " +
-                        "VALUES(@server_id,@id,@player_id,@player_nickname,@moderator_user_id,@moderator_nickname,@issued_at,@reason)", transaction))
+                    if (punishment == null || string.IsNullOrWhiteSpace(punishment.PlayerUserId)) continue;
+                    long playerId = GetOrCreatePlayerId(connection, transaction, punishment.PlayerUserId, punishment.PlayerNickname);
+                    using (NpgsqlCommand command = CreateCommand(connection,
+                        "INSERT INTO punishments(server_id,player_id,moderator_user_id,type,reason,issued_at,expires_at,notified_at) " +
+                        "VALUES(@server_id,@player_id,@moderator_user_id,@type,@reason,@issued_at,@expires_at,@notified_at)", transaction))
                     {
-                        AddWarningParameters(command, warning, playerId);
+                        AddPunishmentParameters(command, punishment, playerId);
                         imported += command.ExecuteNonQuery();
                     }
                 }
-                using (MySqlCommand sequence = CreateCommand(connection,
-                    "UPDATE warning_sequences SET next_id=GREATEST(next_id,(SELECT COALESCE(MAX(id),0)+1 FROM warnings WHERE server_id=@server_id)) WHERE server_id=@server_id", transaction))
-                {
-                    sequence.Parameters.AddWithValue("@server_id", ServerId);
-                    sequence.ExecuteNonQuery();
-                }
                 MarkLegacyImport(connection, transaction, importKey);
                 transaction.Commit();
-                Log.Info($"[Database] Imported {imported} legacy warning(s) from YAML.");
+                Log.Info($"[Database] Imported {imported} legacy warning(s) into punishment history.");
             }
         }
 
@@ -1105,93 +1202,185 @@ namespace SmokyPluginV2.Database
 
         public static string ToExiledUserId(string steamId) => NormalizeSteamId(steamId) + "@steam";
 
-        private const string WarningSelect =
-            "SELECT w.id,p.steam_id,w.player_nickname,w.moderator_user_id,w.moderator_nickname,w.issued_at,w.reason " +
-            "FROM warnings w JOIN players p ON p.id=w.player_id";
+        private const string PunishmentSelect =
+            "SELECT pu.id,p.steam_id,p.last_nickname,COALESCE(al.discord_user_id,'') AS discord_user_id,pu.moderator_user_id," +
+            "COALESCE(ms.last_nickname,md.last_nickname,'') AS moderator_nickname,COALESCE(ms.steam_id,md.steam_id,'') AS moderator_steam_id," +
+            "pu.type,pu.issued_at,pu.expires_at,pu.notified_at,pu.reason FROM punishments pu JOIN players p ON p.id=pu.player_id " +
+            "LEFT JOIN account_links al ON al.player_id=p.id " +
+            "LEFT JOIN players ms ON pu.moderator_user_id LIKE '%@steam' AND ms.steam_id=split_part(pu.moderator_user_id,'@',1) " +
+            "LEFT JOIN account_links mal ON pu.moderator_user_id LIKE '%@discord' AND mal.discord_user_id=split_part(pu.moderator_user_id,'@',1) " +
+            "LEFT JOIN players md ON md.id=mal.player_id";
 
         private void InitializeSchema()
         {
-            using (MySqlConnection connection = OpenConnection())
+            using (NpgsqlConnection connection = OpenConnection())
             {
                 bool locked = false;
                 try
                 {
-                    using (MySqlCommand lockCommand = CreateCommand(connection, "SELECT GET_LOCK('smoky_plugin_v2_schema',15)"))
-                        locked = Convert.ToInt32(lockCommand.ExecuteScalar(), CultureInfo.InvariantCulture) == 1;
-                    if (!locked)
-                        throw new TimeoutException("Could not acquire the MariaDB schema migration lock.");
+                    using (NpgsqlCommand lockCommand = CreateCommand(connection, "SELECT pg_advisory_lock(hashtext('smoky_plugin_v2_schema'))"))
+                        lockCommand.ExecuteNonQuery();
+                    locked = true;
 
-                    foreach (string statement in SchemaStatements)
-                    {
-                        using (MySqlCommand command = CreateCommand(connection, statement))
-                            command.ExecuteNonQuery();
-                    }
-                    using (MySqlCommand privacyMigration = CreateCommand(connection,
-                        "ALTER TABLE players ADD COLUMN IF NOT EXISTS statistics_private BOOLEAN NOT NULL DEFAULT FALSE AFTER last_nickname"))
-                        privacyMigration.ExecuteNonQuery();
-                    using (MySqlCommand referralCodeMigration = CreateCommand(connection,
-                        "ALTER TABLE players ADD COLUMN IF NOT EXISTS referral_code VARCHAR(16) NULL AFTER statistics_private"))
-                        referralCodeMigration.ExecuteNonQuery();
-                    using (MySqlCommand referralCodeIndex = CreateCommand(connection,
-                        "CREATE UNIQUE INDEX IF NOT EXISTS ux_players_referral_code ON players(referral_code)"))
-                        referralCodeIndex.ExecuteNonQuery();
-                    using (MySqlCommand removePersistedPrivileges = CreateCommand(connection,
-                        "DROP TABLE IF EXISTS player_privileges"))
-                        removePersistedPrivileges.ExecuteNonQuery();
-                    using (MySqlCommand version = CreateCommand(connection,
-                        "INSERT IGNORE INTO schema_migrations(version,description) VALUES(1,'Initial MariaDB schema')"))
-                        version.ExecuteNonQuery();
-                    using (MySqlCommand version = CreateCommand(connection,
-                        "INSERT IGNORE INTO schema_migrations(version,description) VALUES(2,'Player statistics privacy')"))
-                        version.ExecuteNonQuery();
-                    using (MySqlCommand version = CreateCommand(connection,
-                        "INSERT IGNORE INTO schema_migrations(version,description) VALUES(4,'Computed playtime privileges')"))
-                        version.ExecuteNonQuery();
-                    using (MySqlCommand version = CreateCommand(connection,
-                        "INSERT IGNORE INTO schema_migrations(version,description) VALUES(5,'Referral program')"))
-                        version.ExecuteNonQuery();
+                    CreateCurrentSchema(connection);
+                    ApplyLegacySchemaCompatibility(connection);
+                    ApplyPendingSchemaMigrations(connection);
                 }
                 finally
                 {
                     if (locked)
                     {
-                        using (MySqlCommand release = CreateCommand(connection, "SELECT RELEASE_LOCK('smoky_plugin_v2_schema')"))
-                            release.ExecuteScalar();
+                        using (NpgsqlCommand release = CreateCommand(connection, "SELECT pg_advisory_unlock(hashtext('smoky_plugin_v2_schema'))"))
+                            release.ExecuteNonQuery();
                     }
                 }
             }
         }
 
+        private static void CreateCurrentSchema(NpgsqlConnection connection)
+        {
+            foreach (string statement in SchemaStatements)
+            {
+                using (NpgsqlCommand command = CreateCommand(connection, statement))
+                    command.ExecuteNonQuery();
+            }
+        }
+
+        private static void ApplyLegacySchemaCompatibility(NpgsqlConnection connection)
+        {
+            using (NpgsqlCommand command = CreateCommand(connection,
+                "ALTER TABLE players ADD COLUMN IF NOT EXISTS statistics_private BOOLEAN NOT NULL DEFAULT FALSE"))
+                command.ExecuteNonQuery();
+            using (NpgsqlCommand command = CreateCommand(connection,
+                "ALTER TABLE players ADD COLUMN IF NOT EXISTS referral_code VARCHAR(16) NULL"))
+                command.ExecuteNonQuery();
+            using (NpgsqlCommand command = CreateCommand(connection,
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_players_referral_code ON players(referral_code)"))
+                command.ExecuteNonQuery();
+            using (NpgsqlCommand command = CreateCommand(connection, "DROP TABLE IF EXISTS player_privileges"))
+                command.ExecuteNonQuery();
+
+            RecordLegacyMigration(connection, 1, "Initial schema");
+            RecordLegacyMigration(connection, 2, "Player statistics privacy");
+            RecordLegacyMigration(connection, 4, "Computed playtime privileges");
+            RecordLegacyMigration(connection, 5, "Referral program");
+            RecordLegacyMigration(connection, 6, "PostgreSQL storage");
+        }
+
+        private static void RecordLegacyMigration(NpgsqlConnection connection, int version, string description)
+        {
+            using (NpgsqlCommand command = CreateCommand(connection,
+                "INSERT INTO schema_migrations(version,description) VALUES(@version,@description) ON CONFLICT(version) DO NOTHING"))
+            {
+                command.Parameters.AddWithValue("@version", version);
+                command.Parameters.AddWithValue("@description", description);
+                command.ExecuteNonQuery();
+            }
+        }
+
+        private static void ApplyPendingSchemaMigrations(NpgsqlConnection connection)
+        {
+            // Keep calls ordered by version. Every new schema/data migration starts at version 8.
+            ApplySchemaMigration(connection, 7, "Unified punishment history", ApplyUnifiedPunishmentHistoryMigration);
+            ApplySchemaMigration(connection, 8, "Warning delivery tracking", ApplyWarningDeliveryTrackingMigration);
+        }
+
+        private static void ApplySchemaMigration(
+            NpgsqlConnection connection,
+            int version,
+            string description,
+            Action<NpgsqlConnection, NpgsqlTransaction> apply)
+        {
+            using (NpgsqlTransaction transaction = connection.BeginTransaction(IsolationLevel.Serializable))
+            {
+                bool alreadyApplied;
+                using (NpgsqlCommand check = CreateCommand(connection,
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=@version)", transaction))
+                {
+                    check.Parameters.AddWithValue("@version", version);
+                    alreadyApplied = Convert.ToBoolean(check.ExecuteScalar(), CultureInfo.InvariantCulture);
+                }
+
+                if (alreadyApplied)
+                {
+                    transaction.Commit();
+                    return;
+                }
+
+                apply(connection, transaction);
+                using (NpgsqlCommand record = CreateCommand(connection,
+                    "INSERT INTO schema_migrations(version,description) VALUES(@version,@description)", transaction))
+                {
+                    record.Parameters.AddWithValue("@version", version);
+                    record.Parameters.AddWithValue("@description", description);
+                    record.ExecuteNonQuery();
+                }
+
+                transaction.Commit();
+            }
+        }
+
+        private static void ApplyUnifiedPunishmentHistoryMigration(
+            NpgsqlConnection connection,
+            NpgsqlTransaction transaction)
+        {
+            bool legacyWarningsExist;
+            using (NpgsqlCommand check = CreateCommand(connection,
+                "SELECT to_regclass('public.warnings') IS NOT NULL", transaction))
+                legacyWarningsExist = Convert.ToBoolean(check.ExecuteScalar(), CultureInfo.InvariantCulture);
+
+            if (legacyWarningsExist)
+            {
+                using (NpgsqlCommand copy = CreateCommand(connection,
+                    "INSERT INTO punishments(server_id,player_id,moderator_user_id,type,reason,issued_at,expires_at) " +
+                    "SELECT server_id,player_id,moderator_user_id,'warning',reason,issued_at,NULL FROM warnings ORDER BY server_id,id", transaction))
+                    copy.ExecuteNonQuery();
+            }
+
+            using (NpgsqlCommand drop = CreateCommand(connection, "DROP TABLE IF EXISTS warning_sequences", transaction))
+                drop.ExecuteNonQuery();
+            using (NpgsqlCommand drop = CreateCommand(connection, "DROP TABLE IF EXISTS warnings", transaction))
+                drop.ExecuteNonQuery();
+        }
+
+        private static void ApplyWarningDeliveryTrackingMigration(
+            NpgsqlConnection connection,
+            NpgsqlTransaction transaction)
+        {
+            using (NpgsqlCommand alter = CreateCommand(connection,
+                "ALTER TABLE punishments ADD COLUMN IF NOT EXISTS notified_at TIMESTAMP(6) WITHOUT TIME ZONE NULL", transaction))
+                alter.ExecuteNonQuery();
+            using (NpgsqlCommand backfill = CreateCommand(connection,
+                "UPDATE punishments SET notified_at=issued_at WHERE type='warning' AND notified_at IS NULL", transaction))
+                backfill.ExecuteNonQuery();
+            using (NpgsqlCommand index = CreateCommand(connection,
+                "CREATE INDEX IF NOT EXISTS ix_punishments_pending_warnings " +
+                "ON punishments(server_id,player_id,id) WHERE type='warning' AND notified_at IS NULL", transaction))
+                index.ExecuteNonQuery();
+        }
+
         private long ResolveServer()
         {
-            using (MySqlConnection connection = OpenConnection())
+            using (NpgsqlConnection connection = OpenConnection())
             {
-                using (MySqlCommand command = CreateCommand(connection,
+                using (NpgsqlCommand command = CreateCommand(connection,
                     "INSERT INTO servers(display_name,game_port) VALUES(@display_name,@game_port) " +
-                    "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id),display_name=VALUES(display_name)"))
+                    "ON CONFLICT(game_port) DO UPDATE SET display_name=EXCLUDED.display_name,updated_at=CURRENT_TIMESTAMP RETURNING id"))
                 {
                     command.Parameters.AddWithValue("@display_name", ServerName);
-                    command.Parameters.AddWithValue("@game_port", Server.Port);
-                    command.ExecuteNonQuery();
-                    long id = command.LastInsertedId;
-                    if (id > 0)
-                        return id;
-                }
-                using (MySqlCommand lookup = CreateCommand(connection, "SELECT id FROM servers WHERE game_port=@game_port"))
-                {
-                    lookup.Parameters.AddWithValue("@game_port", Server.Port);
-                    return Convert.ToInt64(lookup.ExecuteScalar(), CultureInfo.InvariantCulture);
+                    command.Parameters.AddWithValue("@game_port", (int)Server.Port);
+                    return Convert.ToInt64(command.ExecuteScalar(), CultureInfo.InvariantCulture);
                 }
             }
         }
 
-        private MySqlConnection OpenConnection()
+        private NpgsqlConnection OpenConnection()
         {
-            MySqlConnection connection = new MySqlConnection(connectionString);
+            NpgsqlConnection connection = new NpgsqlConnection(connectionString);
             try
             {
                 connection.Open();
-                using (MySqlCommand command = CreateCommand(connection, "SET SESSION time_zone = '+00:00'"))
+                using (NpgsqlCommand command = CreateCommand(connection, "SET TIME ZONE 'UTC'"))
                     command.ExecuteNonQuery();
                 return connection;
             }
@@ -1204,14 +1393,9 @@ namespace SmokyPluginV2.Database
 
         private void EnsureServerStatisticsRow()
         {
-            using (MySqlConnection connection = OpenConnection())
+            using (NpgsqlConnection connection = OpenConnection())
             {
-                using (MySqlCommand command = CreateCommand(connection, "INSERT IGNORE INTO server_statistics(server_id) VALUES(@server_id)"))
-                {
-                    command.Parameters.AddWithValue("@server_id", ServerId);
-                    command.ExecuteNonQuery();
-                }
-                using (MySqlCommand command = CreateCommand(connection, "INSERT IGNORE INTO warning_sequences(server_id,next_id) VALUES(@server_id,1)"))
+                using (NpgsqlCommand command = CreateCommand(connection, "INSERT INTO server_statistics(server_id) VALUES(@server_id) ON CONFLICT(server_id) DO NOTHING"))
                 {
                     command.Parameters.AddWithValue("@server_id", ServerId);
                     command.ExecuteNonQuery();
@@ -1219,9 +1403,9 @@ namespace SmokyPluginV2.Database
             }
         }
 
-        private static MySqlCommand CreateCommand(MySqlConnection connection, string sql, MySqlTransaction transaction = null)
+        private static NpgsqlCommand CreateCommand(NpgsqlConnection connection, string sql, NpgsqlTransaction transaction = null)
         {
-            MySqlCommand command = new MySqlCommand(sql, connection, transaction) { CommandTimeout = CommandTimeoutSeconds };
+            NpgsqlCommand command = new NpgsqlCommand(sql, connection, transaction) { CommandTimeout = CommandTimeoutSeconds };
             return command;
         }
 
@@ -1232,34 +1416,28 @@ namespace SmokyPluginV2.Database
                 throw new InvalidOperationException("Unsupported statistics column: " + invalid);
         }
 
-        private long GetOrCreatePlayerId(MySqlConnection connection, MySqlTransaction transaction, string playerUserId, string nickname)
+        private long GetOrCreatePlayerId(NpgsqlConnection connection, NpgsqlTransaction transaction, string playerUserId, string nickname)
         {
             if (!IsSteamUserId(playerUserId))
                 throw new ArgumentException("Only real Steam players can be persisted.", nameof(playerUserId));
 
-            using (MySqlCommand command = CreateCommand(connection,
+            using (NpgsqlCommand command = CreateCommand(connection,
                 "INSERT INTO players(steam_id,last_nickname) VALUES(@steam_id,@nickname) " +
-                "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id),last_nickname=COALESCE(NULLIF(VALUES(last_nickname),''),last_nickname)", transaction))
+                "ON CONFLICT(steam_id) DO UPDATE SET last_nickname=COALESCE(NULLIF(EXCLUDED.last_nickname,''),players.last_nickname)," +
+                "updated_at=CURRENT_TIMESTAMP RETURNING id", transaction))
             {
                 command.Parameters.AddWithValue("@steam_id", NormalizeSteamId(playerUserId));
                 command.Parameters.AddWithValue("@nickname", nickname ?? string.Empty);
-                command.ExecuteNonQuery();
-                if (command.LastInsertedId > 0)
-                    return command.LastInsertedId;
-            }
-            using (MySqlCommand lookup = CreateCommand(connection, "SELECT id FROM players WHERE steam_id=@steam_id", transaction))
-            {
-                lookup.Parameters.AddWithValue("@steam_id", NormalizeSteamId(playerUserId));
-                return Convert.ToInt64(lookup.ExecuteScalar(), CultureInfo.InvariantCulture);
+                return Convert.ToInt64(command.ExecuteScalar(), CultureInfo.InvariantCulture);
             }
         }
 
         private static long GetTotalNetworkPlaytimeSeconds(
-            MySqlConnection connection,
-            MySqlTransaction transaction,
+            NpgsqlConnection connection,
+            NpgsqlTransaction transaction,
             long playerId)
         {
-            using (MySqlCommand command = CreateCommand(connection,
+            using (NpgsqlCommand command = CreateCommand(connection,
                 "SELECT COALESCE(SUM(COALESCE(human_seconds,0)+COALESCE(scp_seconds,0)+COALESCE(spectator_seconds,0)),0) " +
                 "FROM player_statistics WHERE player_id=@player_id",
                 transaction))
@@ -1270,38 +1448,55 @@ namespace SmokyPluginV2.Database
         }
 
         private static string CreateReferralCode(
-            MySqlConnection connection,
-            MySqlTransaction transaction,
+            NpgsqlConnection connection,
+            NpgsqlTransaction transaction,
             long playerId)
         {
             for (int attempt = 0; attempt < 20; attempt++)
             {
                 string code = GenerateReferralCode();
+                using (NpgsqlCommand savepoint = CreateCommand(connection, "SAVEPOINT referral_code_attempt", transaction))
+                    savepoint.ExecuteNonQuery();
                 try
                 {
-                    using (MySqlCommand update = CreateCommand(connection,
+                    using (NpgsqlCommand update = CreateCommand(connection,
                         "UPDATE players SET referral_code=@code WHERE id=@player_id AND referral_code IS NULL",
                         transaction))
                     {
                         update.Parameters.AddWithValue("@code", code);
                         update.Parameters.AddWithValue("@player_id", playerId);
                         if (update.ExecuteNonQuery() == 1)
+                        {
+                            using (NpgsqlCommand release = CreateCommand(connection, "RELEASE SAVEPOINT referral_code_attempt", transaction))
+                                release.ExecuteNonQuery();
                             return code;
+                        }
                     }
 
-                    using (MySqlCommand existing = CreateCommand(connection,
+                    using (NpgsqlCommand existing = CreateCommand(connection,
                         "SELECT referral_code FROM players WHERE id=@player_id",
                         transaction))
                     {
                         existing.Parameters.AddWithValue("@player_id", playerId);
                         object value = existing.ExecuteScalar();
                         if (value != null && value != DBNull.Value)
+                        {
+                            using (NpgsqlCommand release = CreateCommand(connection, "RELEASE SAVEPOINT referral_code_attempt", transaction))
+                                release.ExecuteNonQuery();
                             return Convert.ToString(value, CultureInfo.InvariantCulture);
+                        }
                     }
+
+                    using (NpgsqlCommand release = CreateCommand(connection, "RELEASE SAVEPOINT referral_code_attempt", transaction))
+                        release.ExecuteNonQuery();
                 }
-                catch (MySqlException exception) when (exception.Number == 1062)
+                catch (PostgresException exception) when (exception.SqlState == "23505")
                 {
-                    // Extremely unlikely code collision; generate a new code in the same transaction.
+                    using (NpgsqlCommand rollback = CreateCommand(connection, "ROLLBACK TO SAVEPOINT referral_code_attempt", transaction))
+                        rollback.ExecuteNonQuery();
+                    using (NpgsqlCommand release = CreateCommand(connection, "RELEASE SAVEPOINT referral_code_attempt", transaction))
+                        release.ExecuteNonQuery();
+                    // Extremely unlikely code collision; the savepoint keeps this transaction usable.
                 }
             }
 
@@ -1333,43 +1528,56 @@ namespace SmokyPluginV2.Database
         private static long SaturatingAdd(long left, long right) =>
             left > long.MaxValue - right ? long.MaxValue : left + right;
 
-        private void InsertWarning(MySqlConnection connection, MySqlTransaction transaction, WarningRecord warning, long playerId)
-        {
-            using (MySqlCommand command = CreateCommand(connection,
-                "INSERT INTO warnings(server_id,id,player_id,player_nickname,moderator_user_id,moderator_nickname,issued_at,reason) " +
-                "VALUES(@server_id,@id,@player_id,@player_nickname,@moderator_user_id,@moderator_nickname,@issued_at,@reason)", transaction))
-            {
-                AddWarningParameters(command, warning, playerId);
-                command.ExecuteNonQuery();
-            }
-        }
-
-        private void AddWarningParameters(MySqlCommand command, WarningRecord warning, long playerId)
+        private void AddPunishmentParameters(NpgsqlCommand command, PunishmentRecord punishment, long playerId)
         {
             command.Parameters.AddWithValue("@server_id", ServerId);
-            command.Parameters.AddWithValue("@id", warning.Id);
             command.Parameters.AddWithValue("@player_id", playerId);
-            command.Parameters.AddWithValue("@player_nickname", warning.PlayerNickname ?? string.Empty);
-            command.Parameters.AddWithValue("@moderator_user_id", warning.ModeratorUserId ?? string.Empty);
-            command.Parameters.AddWithValue("@moderator_nickname", warning.ModeratorNickname ?? string.Empty);
-            command.Parameters.AddWithValue("@issued_at", warning.IssuedAtUtc);
-            command.Parameters.AddWithValue("@reason", warning.Reason ?? string.Empty);
+            command.Parameters.AddWithValue("@moderator_user_id", punishment.ModeratorUserId ?? string.Empty);
+            command.Parameters.AddWithValue("@type", PunishmentTypeToDatabase(punishment.Type));
+            command.Parameters.AddWithValue("@reason", punishment.Reason ?? string.Empty);
+            command.Parameters.AddWithValue("@issued_at", punishment.IssuedAtUtc);
+            command.Parameters.AddWithValue("@expires_at", (object)punishment.ExpiresAtUtc ?? DBNull.Value);
+            command.Parameters.AddWithValue("@notified_at", (object)punishment.NotifiedAtUtc ?? DBNull.Value);
         }
 
-        private static WarningRecord ReadWarning(MySqlDataReader reader) => new WarningRecord
+        private static PunishmentRecord ReadPunishment(NpgsqlDataReader reader)
         {
-            Id = reader.GetInt64("id"),
-            PlayerUserId = ToExiledUserId(reader.GetString("steam_id")),
-            PlayerNickname = reader.GetString("player_nickname"),
-            ModeratorUserId = reader.GetString("moderator_user_id"),
-            ModeratorNickname = reader.GetString("moderator_nickname"),
-            IssuedAtUtc = DateTime.SpecifyKind(reader.GetDateTime("issued_at"), DateTimeKind.Utc),
-            Reason = reader.GetString("reason"),
+            string discord = GetString(reader, "discord_user_id");
+            ulong.TryParse(discord, NumberStyles.None, CultureInfo.InvariantCulture, out ulong discordUserId);
+            return new PunishmentRecord
+            {
+                Id = GetInt64(reader, "id"),
+                PlayerUserId = ToExiledUserId(GetString(reader, "steam_id")),
+                PlayerNickname = reader["last_nickname"] == DBNull.Value ? string.Empty : GetString(reader, "last_nickname"),
+                DiscordUserId = discordUserId,
+                ModeratorUserId = GetString(reader, "moderator_user_id"),
+                ModeratorNickname = GetString(reader, "moderator_nickname"),
+                ModeratorSteamId = GetString(reader, "moderator_steam_id"),
+                Type = PunishmentTypeFromDatabase(GetString(reader, "type")),
+                IssuedAtUtc = DateTime.SpecifyKind(GetDateTime(reader, "issued_at"), DateTimeKind.Utc),
+                ExpiresAtUtc = GetNullableDateTime(reader, "expires_at"),
+                NotifiedAtUtc = GetNullableDateTime(reader, "notified_at"),
+                Reason = GetString(reader, "reason"),
+            };
+        }
+
+        private static string PunishmentTypeToDatabase(PunishmentType type) => type switch
+        {
+            PunishmentType.Warning => "warning",
+            PunishmentType.Kick => "kick",
+            PunishmentType.Ban => "ban",
+            _ => throw new ArgumentOutOfRangeException(nameof(type)),
         };
 
-        private static PlayerStatisticsRecord ReadPlayerStatistics(MySqlDataReader reader) => new PlayerStatisticsRecord
+        private static PunishmentType PunishmentTypeFromDatabase(string type) =>
+            string.Equals(type, "warning", StringComparison.OrdinalIgnoreCase) ? PunishmentType.Warning :
+            string.Equals(type, "kick", StringComparison.OrdinalIgnoreCase) ? PunishmentType.Kick :
+            string.Equals(type, "ban", StringComparison.OrdinalIgnoreCase) ? PunishmentType.Ban :
+            throw new InvalidOperationException("Unknown punishment type: " + type);
+
+        private static PlayerStatisticsRecord ReadPlayerStatistics(NpgsqlDataReader reader) => new PlayerStatisticsRecord
         {
-            SteamId = reader.GetString("steam_id"), Nickname = reader.IsDBNull(reader.GetOrdinal("last_nickname")) ? string.Empty : reader.GetString("last_nickname"),
+            SteamId = GetString(reader, "steam_id"), Nickname = reader.IsDBNull(reader.GetOrdinal("last_nickname")) ? string.Empty : GetString(reader, "last_nickname"),
             StatisticsPrivate = Convert.ToBoolean(reader["statistics_private"], CultureInfo.InvariantCulture),
             LastSeenUtc = GetNullableDateTime(reader, "last_seen"), RoundsCompleted = GetInt64(reader, "rounds_completed"),
             HumanSeconds = GetInt64(reader, "human_seconds"), ScpSeconds = GetInt64(reader, "scp_seconds"), SpectatorSeconds = GetInt64(reader, "spectator_seconds"),
@@ -1388,9 +1596,9 @@ namespace SmokyPluginV2.Database
             TeslaKillsAs079 = GetInt64(reader, "tesla_kills_as_079"), PinkCandiesEaten = GetInt64(reader, "pink_candies_eaten"),
         };
 
-        private static ServerStatisticsRecord ReadServerStatistics(MySqlDataReader reader) => new ServerStatisticsRecord
+        private static ServerStatisticsRecord ReadServerStatistics(NpgsqlDataReader reader) => new ServerStatisticsRecord
         {
-            ServerName = reader.GetString("display_name"), RoundsCompleted = GetInt64(reader, "rounds_completed"), TotalRoundSeconds = GetInt64(reader, "total_round_seconds"),
+            ServerName = GetString(reader, "display_name"), RoundsCompleted = GetInt64(reader, "rounds_completed"), TotalRoundSeconds = GetInt64(reader, "total_round_seconds"),
             LongestRoundSeconds = GetInt64(reader, "longest_round_seconds"), ScpWins = GetInt64(reader, "scp_wins"), FoundationWins = GetInt64(reader, "foundation_wins"),
             ChaosWins = GetInt64(reader, "chaos_wins"), Draws = GetInt64(reader, "draws"),
             WarheadDetonations = GetInt64(reader, "warhead_detonations"),
@@ -1399,22 +1607,24 @@ namespace SmokyPluginV2.Database
             MtfReinforcementWaves = GetInt64(reader, "mtf_reinforcement_waves"), ChaosReinforcementWaves = GetInt64(reader, "chaos_reinforcement_waves"),
         };
 
-        private static long GetInt64(MySqlDataReader reader, string name) => Convert.ToInt64(reader[name], CultureInfo.InvariantCulture);
-        private static long? GetNullableInt64(MySqlDataReader reader, string name) => reader[name] == DBNull.Value ? (long?)null : Convert.ToInt64(reader[name], CultureInfo.InvariantCulture);
-        private static DateTime? GetNullableDateTime(MySqlDataReader reader, string name) => reader[name] == DBNull.Value ? (DateTime?)null : DateTime.SpecifyKind(Convert.ToDateTime(reader[name], CultureInfo.InvariantCulture), DateTimeKind.Utc);
+        private static long GetInt64(NpgsqlDataReader reader, string name) => Convert.ToInt64(reader[name], CultureInfo.InvariantCulture);
+        private static string GetString(NpgsqlDataReader reader, string name) => Convert.ToString(reader[name], CultureInfo.InvariantCulture);
+        private static DateTime GetDateTime(NpgsqlDataReader reader, string name) => Convert.ToDateTime(reader[name], CultureInfo.InvariantCulture);
+        private static long? GetNullableInt64(NpgsqlDataReader reader, string name) => reader[name] == DBNull.Value ? (long?)null : Convert.ToInt64(reader[name], CultureInfo.InvariantCulture);
+        private static DateTime? GetNullableDateTime(NpgsqlDataReader reader, string name) => reader[name] == DBNull.Value ? (DateTime?)null : DateTime.SpecifyKind(Convert.ToDateTime(reader[name], CultureInfo.InvariantCulture), DateTimeKind.Utc);
 
-        private static bool LegacyImportExists(MySqlConnection connection, MySqlTransaction transaction, string importKey)
+        private static bool LegacyImportExists(NpgsqlConnection connection, NpgsqlTransaction transaction, string importKey)
         {
-            using (MySqlCommand command = CreateCommand(connection, "SELECT 1 FROM legacy_imports WHERE import_key=@key FOR UPDATE", transaction))
+            using (NpgsqlCommand command = CreateCommand(connection, "SELECT 1 FROM legacy_imports WHERE import_key=@key FOR UPDATE", transaction))
             {
                 command.Parameters.AddWithValue("@key", importKey);
                 return command.ExecuteScalar() != null;
             }
         }
 
-        private static void MarkLegacyImport(MySqlConnection connection, MySqlTransaction transaction, string importKey)
+        private static void MarkLegacyImport(NpgsqlConnection connection, NpgsqlTransaction transaction, string importKey)
         {
-            using (MySqlCommand command = CreateCommand(connection, "INSERT INTO legacy_imports(import_key) VALUES(@key)", transaction))
+            using (NpgsqlCommand command = CreateCommand(connection, "INSERT INTO legacy_imports(import_key) VALUES(@key)", transaction))
             {
                 command.Parameters.AddWithValue("@key", importKey);
                 command.ExecuteNonQuery();
@@ -1423,23 +1633,26 @@ namespace SmokyPluginV2.Database
 
         private static bool Fail(string operation, Exception exception, out string error)
         {
-            error = "Ошибка MariaDB. Подробности записаны в консоль сервера.";
+            error = "Ошибка PostgreSQL. Подробности записаны в консоль сервера.";
             Log.Error($"[Database] Failed {operation}:\n{exception}");
             return false;
         }
 
         private static readonly string[] SchemaStatements =
         {
-            "CREATE TABLE IF NOT EXISTS schema_migrations(version INT UNSIGNED NOT NULL PRIMARY KEY,description VARCHAR(255) NOT NULL,applied_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
-            "CREATE TABLE IF NOT EXISTS servers(id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,display_name VARCHAR(128) NOT NULL,game_port SMALLINT UNSIGNED NOT NULL UNIQUE,created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
-            "CREATE TABLE IF NOT EXISTS players(id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,steam_id VARCHAR(32) NOT NULL UNIQUE,last_nickname VARCHAR(64) NULL,statistics_private BOOLEAN NOT NULL DEFAULT FALSE,referral_code VARCHAR(16) NULL,created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
-            "CREATE TABLE IF NOT EXISTS account_links(player_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,discord_user_id VARCHAR(20) NOT NULL UNIQUE,linked_at DATETIME(6) NOT NULL,CONSTRAINT fk_account_links_player FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
-            "CREATE TABLE IF NOT EXISTS referrals(invited_player_id BIGINT UNSIGNED NOT NULL,inviter_player_id BIGINT UNSIGNED NOT NULL,accepted_at DATETIME(6) NOT NULL,PRIMARY KEY(invited_player_id),KEY ix_referrals_inviter(inviter_player_id),CONSTRAINT fk_referrals_invited FOREIGN KEY(invited_player_id) REFERENCES players(id) ON DELETE CASCADE,CONSTRAINT fk_referrals_inviter FOREIGN KEY(inviter_player_id) REFERENCES players(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
-            "CREATE TABLE IF NOT EXISTS warnings(server_id BIGINT UNSIGNED NOT NULL,id BIGINT UNSIGNED NOT NULL,player_id BIGINT UNSIGNED NOT NULL,player_nickname VARCHAR(64) NOT NULL,moderator_user_id VARCHAR(64) NOT NULL,moderator_nickname VARCHAR(64) NOT NULL,issued_at DATETIME(6) NOT NULL,reason TEXT NOT NULL,PRIMARY KEY(server_id,id),KEY ix_warnings_player(server_id,player_id),CONSTRAINT fk_warnings_server FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,CONSTRAINT fk_warnings_player FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE RESTRICT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
-            "CREATE TABLE IF NOT EXISTS warning_sequences(server_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,next_id BIGINT UNSIGNED NOT NULL DEFAULT 1,CONSTRAINT fk_warning_sequences_server FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
-            "CREATE TABLE IF NOT EXISTS player_statistics(server_id BIGINT UNSIGNED NOT NULL,player_id BIGINT UNSIGNED NOT NULL,last_seen DATETIME(6) NOT NULL,rounds_completed BIGINT UNSIGNED NOT NULL DEFAULT 0,human_seconds BIGINT UNSIGNED NOT NULL DEFAULT 0,scp_seconds BIGINT UNSIGNED NOT NULL DEFAULT 0,spectator_seconds BIGINT UNSIGNED NOT NULL DEFAULT 0,best_human_kills_round BIGINT UNSIGNED NOT NULL DEFAULT 0,best_scp_kills_round BIGINT UNSIGNED NOT NULL DEFAULT 0,longest_human_life_seconds BIGINT UNSIGNED NOT NULL DEFAULT 0,longest_scp_life_seconds BIGINT UNSIGNED NOT NULL DEFAULT 0,human_kills_as_human BIGINT UNSIGNED NOT NULL DEFAULT 0,human_kills_as_scp BIGINT UNSIGNED NOT NULL DEFAULT 0,scps_destroyed BIGINT UNSIGNED NOT NULL DEFAULT 0,human_deaths BIGINT UNSIGNED NOT NULL DEFAULT 0,scp_deaths BIGINT UNSIGNED NOT NULL DEFAULT 0,classd_escapes_uncuffed BIGINT UNSIGNED NOT NULL DEFAULT 0,fastest_classd_escape_uncuffed_seconds BIGINT UNSIGNED NULL,classd_escapes_cuffed BIGINT UNSIGNED NOT NULL DEFAULT 0,fastest_classd_escape_cuffed_seconds BIGINT UNSIGNED NULL,scientist_escapes_uncuffed BIGINT UNSIGNED NOT NULL DEFAULT 0,fastest_scientist_escape_uncuffed_seconds BIGINT UNSIGNED NULL,scientist_escapes_cuffed BIGINT UNSIGNED NOT NULL DEFAULT 0,fastest_scientist_escape_cuffed_seconds BIGINT UNSIGNED NULL,classd_escorted BIGINT UNSIGNED NOT NULL DEFAULT 0,scientist_escorted BIGINT UNSIGNED NOT NULL DEFAULT 0,warhead_countdowns_started BIGINT UNSIGNED NOT NULL DEFAULT 0,warhead_detonations BIGINT UNSIGNED NOT NULL DEFAULT 0,warhead_countdowns_stopped BIGINT UNSIGNED NOT NULL DEFAULT 0,pocket_entries BIGINT UNSIGNED NOT NULL DEFAULT 0,pocket_escapes BIGINT UNSIGNED NOT NULL DEFAULT 0,longest_pocket_seconds BIGINT UNSIGNED NOT NULL DEFAULT 0,zombies_created BIGINT UNSIGNED NOT NULL DEFAULT 0,generators_activated BIGINT UNSIGNED NOT NULL DEFAULT 0,system_reboots_started BIGINT UNSIGNED NOT NULL DEFAULT 0,tesla_kills_as_079 BIGINT UNSIGNED NOT NULL DEFAULT 0,pink_candies_eaten BIGINT UNSIGNED NOT NULL DEFAULT 0,PRIMARY KEY(server_id,player_id),KEY ix_player_statistics_last_seen(server_id,last_seen),CONSTRAINT fk_player_statistics_server FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,CONSTRAINT fk_player_statistics_player FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
-            "CREATE TABLE IF NOT EXISTS server_statistics(server_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,rounds_completed BIGINT UNSIGNED NOT NULL DEFAULT 0,total_round_seconds BIGINT UNSIGNED NOT NULL DEFAULT 0,longest_round_seconds BIGINT UNSIGNED NOT NULL DEFAULT 0,scp_wins BIGINT UNSIGNED NOT NULL DEFAULT 0,foundation_wins BIGINT UNSIGNED NOT NULL DEFAULT 0,chaos_wins BIGINT UNSIGNED NOT NULL DEFAULT 0,draws BIGINT UNSIGNED NOT NULL DEFAULT 0,warhead_detonations BIGINT UNSIGNED NOT NULL DEFAULT 0,automatic_warhead_detonations BIGINT UNSIGNED NOT NULL DEFAULT 0,player_warhead_detonations BIGINT UNSIGNED NOT NULL DEFAULT 0,mtf_main_waves BIGINT UNSIGNED NOT NULL DEFAULT 0,chaos_main_waves BIGINT UNSIGNED NOT NULL DEFAULT 0,mtf_reinforcement_waves BIGINT UNSIGNED NOT NULL DEFAULT 0,chaos_reinforcement_waves BIGINT UNSIGNED NOT NULL DEFAULT 0,CONSTRAINT fk_server_statistics_server FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
-            "CREATE TABLE IF NOT EXISTS legacy_imports(import_key VARCHAR(191) NOT NULL PRIMARY KEY,imported_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+            "CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER NOT NULL PRIMARY KEY,description VARCHAR(255) NOT NULL,applied_at TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP(6))",
+            "CREATE TABLE IF NOT EXISTS servers(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,display_name VARCHAR(128) NOT NULL,game_port INTEGER NOT NULL UNIQUE CHECK(game_port BETWEEN 1 AND 65535),created_at TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP(6),updated_at TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP(6))",
+            "CREATE TABLE IF NOT EXISTS players(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,steam_id VARCHAR(32) NOT NULL UNIQUE,last_nickname VARCHAR(64) NULL,statistics_private BOOLEAN NOT NULL DEFAULT FALSE,referral_code VARCHAR(16) NULL,created_at TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP(6),updated_at TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP(6))",
+            "CREATE TABLE IF NOT EXISTS account_links(player_id BIGINT NOT NULL PRIMARY KEY,discord_user_id VARCHAR(20) NOT NULL UNIQUE,linked_at TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL,CONSTRAINT fk_account_links_player FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE)",
+            "CREATE TABLE IF NOT EXISTS referrals(invited_player_id BIGINT NOT NULL,inviter_player_id BIGINT NOT NULL,accepted_at TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL,PRIMARY KEY(invited_player_id),CONSTRAINT fk_referrals_invited FOREIGN KEY(invited_player_id) REFERENCES players(id) ON DELETE CASCADE,CONSTRAINT fk_referrals_inviter FOREIGN KEY(inviter_player_id) REFERENCES players(id) ON DELETE CASCADE)",
+            "CREATE TABLE IF NOT EXISTS punishments(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,server_id BIGINT NOT NULL,player_id BIGINT NOT NULL,moderator_user_id VARCHAR(64) NOT NULL,type VARCHAR(16) NOT NULL CHECK(type IN ('warning','kick','ban')),reason TEXT NOT NULL,issued_at TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL,expires_at TIMESTAMP(6) WITHOUT TIME ZONE NULL,notified_at TIMESTAMP(6) WITHOUT TIME ZONE NULL,CONSTRAINT fk_punishments_server FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,CONSTRAINT fk_punishments_player FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE RESTRICT)",
+            "CREATE TABLE IF NOT EXISTS player_statistics(server_id BIGINT NOT NULL,player_id BIGINT NOT NULL,last_seen TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL,rounds_completed BIGINT NOT NULL DEFAULT 0,human_seconds BIGINT NOT NULL DEFAULT 0,scp_seconds BIGINT NOT NULL DEFAULT 0,spectator_seconds BIGINT NOT NULL DEFAULT 0,best_human_kills_round BIGINT NOT NULL DEFAULT 0,best_scp_kills_round BIGINT NOT NULL DEFAULT 0,longest_human_life_seconds BIGINT NOT NULL DEFAULT 0,longest_scp_life_seconds BIGINT NOT NULL DEFAULT 0,human_kills_as_human BIGINT NOT NULL DEFAULT 0,human_kills_as_scp BIGINT NOT NULL DEFAULT 0,scps_destroyed BIGINT NOT NULL DEFAULT 0,human_deaths BIGINT NOT NULL DEFAULT 0,scp_deaths BIGINT NOT NULL DEFAULT 0,classd_escapes_uncuffed BIGINT NOT NULL DEFAULT 0,fastest_classd_escape_uncuffed_seconds BIGINT NULL,classd_escapes_cuffed BIGINT NOT NULL DEFAULT 0,fastest_classd_escape_cuffed_seconds BIGINT NULL,scientist_escapes_uncuffed BIGINT NOT NULL DEFAULT 0,fastest_scientist_escape_uncuffed_seconds BIGINT NULL,scientist_escapes_cuffed BIGINT NOT NULL DEFAULT 0,fastest_scientist_escape_cuffed_seconds BIGINT NULL,classd_escorted BIGINT NOT NULL DEFAULT 0,scientist_escorted BIGINT NOT NULL DEFAULT 0,warhead_countdowns_started BIGINT NOT NULL DEFAULT 0,warhead_detonations BIGINT NOT NULL DEFAULT 0,warhead_countdowns_stopped BIGINT NOT NULL DEFAULT 0,pocket_entries BIGINT NOT NULL DEFAULT 0,pocket_escapes BIGINT NOT NULL DEFAULT 0,longest_pocket_seconds BIGINT NOT NULL DEFAULT 0,zombies_created BIGINT NOT NULL DEFAULT 0,generators_activated BIGINT NOT NULL DEFAULT 0,system_reboots_started BIGINT NOT NULL DEFAULT 0,tesla_kills_as_079 BIGINT NOT NULL DEFAULT 0,pink_candies_eaten BIGINT NOT NULL DEFAULT 0,PRIMARY KEY(server_id,player_id),CONSTRAINT fk_player_statistics_server FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,CONSTRAINT fk_player_statistics_player FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE)",
+            "CREATE TABLE IF NOT EXISTS server_statistics(server_id BIGINT NOT NULL PRIMARY KEY,rounds_completed BIGINT NOT NULL DEFAULT 0,total_round_seconds BIGINT NOT NULL DEFAULT 0,longest_round_seconds BIGINT NOT NULL DEFAULT 0,scp_wins BIGINT NOT NULL DEFAULT 0,foundation_wins BIGINT NOT NULL DEFAULT 0,chaos_wins BIGINT NOT NULL DEFAULT 0,draws BIGINT NOT NULL DEFAULT 0,warhead_detonations BIGINT NOT NULL DEFAULT 0,automatic_warhead_detonations BIGINT NOT NULL DEFAULT 0,player_warhead_detonations BIGINT NOT NULL DEFAULT 0,mtf_main_waves BIGINT NOT NULL DEFAULT 0,chaos_main_waves BIGINT NOT NULL DEFAULT 0,mtf_reinforcement_waves BIGINT NOT NULL DEFAULT 0,chaos_reinforcement_waves BIGINT NOT NULL DEFAULT 0,CONSTRAINT fk_server_statistics_server FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE)",
+            "CREATE TABLE IF NOT EXISTS legacy_imports(import_key VARCHAR(191) NOT NULL PRIMARY KEY,imported_at TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP(6))",
+            "CREATE INDEX IF NOT EXISTS ix_referrals_inviter ON referrals(inviter_player_id)",
+            "CREATE INDEX IF NOT EXISTS ix_punishments_player ON punishments(server_id,player_id,id DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_punishments_active_bans ON punishments(server_id,player_id,expires_at) WHERE type='ban'",
+            "CREATE INDEX IF NOT EXISTS ix_player_statistics_last_seen ON player_statistics(server_id,last_seen)",
         };
     }
 }

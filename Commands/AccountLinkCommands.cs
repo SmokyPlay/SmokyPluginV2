@@ -95,7 +95,7 @@ namespace SmokyPluginV2.Commands
                 player.UserId,
                 previousDiscordUserId,
                 true);
-            response = "Игровой аккаунт отвязан от Discord. Игровая группа будет пересчитана по привилегиям MariaDB.";
+            response = "Игровой аккаунт отвязан от Discord. Игровая группа будет пересчитана по привилегиям PostgreSQL.";
             return true;
         }
     }

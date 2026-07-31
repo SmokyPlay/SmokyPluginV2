@@ -34,7 +34,7 @@ namespace SmokyPluginV2.Commands
             StatisticsService statistics = Plugin.Instance?.Statistics;
             if (statistics is null || settings?.IsEnabled != true || Plugin.Instance?.Database is null)
             {
-                response = "Система статистики отключена или MariaDB недоступна.";
+                response = "Система статистики отключена или PostgreSQL недоступна.";
                 return false;
             }
 
@@ -56,13 +56,13 @@ namespace SmokyPluginV2.Commands
 
             if (!existed)
             {
-                response = $"Для игрока `{MariaDbService.NormalizeSteamId(userId)}` на этом сервере сохранённая статистика не найдена.";
+                response = $"Для игрока `{PostgreSqlService.NormalizeSteamId(userId)}` на этом сервере сохранённая статистика не найдена.";
                 return false;
             }
 
             string playerText = onlinePlayer != null
-                ? $"{onlinePlayer.Nickname} ({MariaDbService.NormalizeSteamId(userId)})"
-                : MariaDbService.NormalizeSteamId(userId);
+                ? $"{onlinePlayer.Nickname} ({PostgreSqlService.NormalizeSteamId(userId)})"
+                : PostgreSqlService.NormalizeSteamId(userId);
             response = $"Статистика игрока {playerText} на этом сервере полностью очищена. Новые события будут записываться с этого момента.";
             return true;
         }
@@ -83,7 +83,7 @@ namespace SmokyPluginV2.Commands
                 (provider.Length == 0 || provider.Equals("@steam", StringComparison.OrdinalIgnoreCase));
             if (validSteamId)
             {
-                userId = MariaDbService.ToExiledUserId(steamId);
+                userId = PostgreSqlService.ToExiledUserId(steamId);
                 onlinePlayer = Player.Get(userId);
                 return true;
             }

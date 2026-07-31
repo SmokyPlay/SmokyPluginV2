@@ -49,8 +49,44 @@
     <Reference Include="System.Data" />
     <Reference Include="System.Net.Http" />
 
-    <Reference Include="MySqlConnector">
-      <HintPath>lib\MySqlConnector\MySqlConnector.dll</HintPath>
+    <Reference Include="Npgsql">
+      <HintPath>lib\Npgsql\Npgsql.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Microsoft.Bcl.AsyncInterfaces">
+      <HintPath>lib\Npgsql\Microsoft.Bcl.AsyncInterfaces.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="System.Buffers">
+      <HintPath>lib\Npgsql\System.Buffers.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="System.Memory">
+      <HintPath>lib\Npgsql\System.Memory.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="System.Numerics.Vectors">
+      <HintPath>lib\Npgsql\System.Numerics.Vectors.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="System.Runtime.CompilerServices.Unsafe">
+      <HintPath>lib\Npgsql\System.Runtime.CompilerServices.Unsafe.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="System.Text.Encodings.Web">
+      <HintPath>lib\Npgsql\System.Text.Encodings.Web.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="System.Text.Json">
+      <HintPath>lib\Npgsql\System.Text.Json.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="System.Threading.Tasks.Extensions">
+      <HintPath>lib\Npgsql\System.Threading.Tasks.Extensions.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="System.ValueTuple">
+      <HintPath>lib\Npgsql\System.ValueTuple.dll</HintPath>
       <Private>true</Private>
     </Reference>
 
@@ -131,7 +167,7 @@
     <Compile Include="Commands\StatisticsClearCommand.cs" />
     <Compile Include="Commands\WarningCommands.cs" />
     <Compile Include="Config.cs" />
-    <Compile Include="Database\MariaDbService.cs" />
+    <Compile Include="Database\PostgreSqlService.cs" />
     <Compile Include="Database\SharedDatabaseConfig.cs" />
     <Compile Include="Discord\DiscordBotClient.cs" />
     <Compile Include="Discord\DiscordCommandSender.cs" />
@@ -149,6 +185,9 @@
     <Compile Include="Handlers\EndRoundFriendlyFireHandler.cs" />
     <Compile Include="Handlers\LateJoinSpawnHandler.cs" />
     <Compile Include="Handlers\PinkCandyHandler.cs" />
+    <Compile Include="Moderation\PunishmentRecord.cs" />
+    <Compile Include="Moderation\PunishmentService.cs" />
+    <Compile Include="Moderation\WarningNotificationService.cs" />
     <Compile Include="Patches\DiscordPermissionPatch.cs" />
     <Compile Include="Patches\RemoteAdminCommandLoggingPatch.cs" />
     <Compile Include="Patches\RemoteAdminReloadPatch.cs" />
@@ -168,8 +207,6 @@
     <Compile Include="RolePreferences\RolePreferenceTowerService.cs" />
     <Compile Include="Statistics\StatisticsModels.cs" />
     <Compile Include="Statistics\StatisticsService.cs" />
-    <Compile Include="Warnings\WarningRecord.cs" />
-    <Compile Include="Warnings\WarningService.cs" />
   </ItemGroup>
 
   <Target Name="ValidateReferencePaths" BeforeTargets="ResolveReferences">

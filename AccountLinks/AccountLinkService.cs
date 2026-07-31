@@ -19,11 +19,11 @@ namespace SmokyPluginV2.AccountLinks
         private const string CodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
         private readonly object syncRoot = new object();
-        private readonly MariaDbService database;
+        private readonly PostgreSqlService database;
         private readonly Dictionary<string, PendingLink> pendingByCode = new Dictionary<string, PendingLink>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<ulong, string> pendingCodeByDiscord = new Dictionary<ulong, string>();
 
-        public AccountLinkService(MariaDbService database, bool importLegacyYaml)
+        public AccountLinkService(PostgreSqlService database, bool importLegacyYaml)
         {
             this.database = database ?? throw new ArgumentNullException(nameof(database));
             DirectoryPath = Path.Combine(Paths.Exiled, "Data", "SmokyPluginV2", Server.Port.ToString());

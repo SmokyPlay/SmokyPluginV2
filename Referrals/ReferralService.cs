@@ -13,14 +13,14 @@ namespace SmokyPluginV2.Referrals
 
     internal sealed class ReferralService : IDisposable
     {
-        private readonly MariaDbService database;
+        private readonly PostgreSqlService database;
         private readonly HashSet<string> janitorCardUses =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly object janitorCardLock = new object();
         private ReferralSettings settings;
         private bool registered;
 
-        public ReferralService(MariaDbService database, ReferralSettings settings)
+        public ReferralService(PostgreSqlService database, ReferralSettings settings)
         {
             this.database = database ?? throw new ArgumentNullException(nameof(database));
             this.settings = settings ?? new ReferralSettings();

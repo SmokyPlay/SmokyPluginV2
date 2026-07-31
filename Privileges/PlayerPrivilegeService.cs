@@ -9,10 +9,10 @@ namespace SmokyPluginV2.Privileges
 
     internal sealed class PlayerPrivilegeService
     {
-        private readonly MariaDbService database;
+        private readonly PostgreSqlService database;
         private EarnedPrivilegeSettings settings;
 
-        public PlayerPrivilegeService(MariaDbService database, EarnedPrivilegeSettings settings)
+        public PlayerPrivilegeService(PostgreSqlService database, EarnedPrivilegeSettings settings)
         {
             this.database = database ?? throw new ArgumentNullException(nameof(database));
             this.settings = settings ?? new EarnedPrivilegeSettings();
@@ -23,9 +23,36 @@ namespace SmokyPluginV2.Privileges
             settings = reloadedSettings ?? new EarnedPrivilegeSettings();
         }
 
-        public bool TryResolveBySteamId(string playerUserId, out PlayerAccessSnapshot snapshot, out string error)
+        public bool TryResolveBySteamId(
+            string playerUserId,
+            out PlayerAccessSnapshot snapshot,
+            out string error)
         {
             snapshot = null;
+            if (!TryResolveIdentityBySteamId(playerUserId, out PlayerAccessIdentity identity, out error))
+                return false;
+
+            return TryResolve(identity, out snapshot, out error);
+        }
+
+        public bool TryResolveByDiscordId(
+            ulong discordUserId,
+            out PlayerAccessSnapshot snapshot,
+            out string error)
+        {
+            snapshot = null;
+            if (!TryResolveIdentityByDiscordId(discordUserId, out PlayerAccessIdentity identity, out error))
+                return false;
+
+            return TryResolve(identity, out snapshot, out error);
+        }
+
+        public bool TryResolveIdentityBySteamId(
+            string playerUserId,
+            out PlayerAccessIdentity identity,
+            out string error)
+        {
+            identity = null;
             if (!database.TryResolveAccessIdentityBySteamId(
                     playerUserId,
                     out long playerId,
@@ -36,20 +63,21 @@ namespace SmokyPluginV2.Privileges
                 return false;
             }
 
-            return TryResolveSources(
-                new ResolvedIdentity
-                {
-                    PlayerId = playerId,
-                    PlayerUserId = resolvedPlayerUserId,
-                    DiscordUserId = discordUserId,
-                },
-                out snapshot,
-                out error);
+            identity = new PlayerAccessIdentity
+            {
+                PlayerId = playerId,
+                PlayerUserId = resolvedPlayerUserId,
+                DiscordUserId = discordUserId,
+            };
+            return true;
         }
 
-        public bool TryResolveByDiscordId(ulong discordUserId, out PlayerAccessSnapshot snapshot, out string error)
+        public bool TryResolveIdentityByDiscordId(
+            ulong discordUserId,
+            out PlayerAccessIdentity identity,
+            out string error)
         {
-            snapshot = null;
+            identity = null;
             if (discordUserId == 0)
             {
                 error = "Discord ID не указан.";
@@ -65,23 +93,27 @@ namespace SmokyPluginV2.Privileges
                 return false;
             }
 
-            return TryResolveSources(
-                new ResolvedIdentity
-                {
-                    PlayerId = playerId,
-                    PlayerUserId = playerUserId,
-                    DiscordUserId = discordUserId,
-                },
-                out snapshot,
-                out error);
+            identity = new PlayerAccessIdentity
+            {
+                PlayerId = playerId,
+                PlayerUserId = playerUserId,
+                DiscordUserId = discordUserId,
+            };
+            return true;
         }
 
-        private bool TryResolveSources(
-            ResolvedIdentity identity,
+        public bool TryResolve(
+            PlayerAccessIdentity identity,
             out PlayerAccessSnapshot snapshot,
             out string error)
         {
             snapshot = null;
+            if (identity == null)
+            {
+                error = "Не удалось определить связку аккаунтов.";
+                return false;
+            }
+
             EarnedPrivilegeSettings currentSettings = settings ?? new EarnedPrivilegeSettings();
             string groupName = (currentSettings.GroupName ?? string.Empty).Trim();
             if (groupName.Length > 64)
@@ -93,23 +125,30 @@ namespace SmokyPluginV2.Privileges
             HashSet<string> steamPrivilegeGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             HashSet<string> discordPrivilegeGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             HashSet<string> managedDiscordGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            List<PendingPrivilegeRevocation> pendingRevocations = new List<PendingPrivilegeRevocation>();
             if (!TryResolveSteamPrivileges(
                     identity,
                     currentSettings,
                     groupName,
                     steamPrivilegeGroups,
+                    managedDiscordGroups,
+                    pendingRevocations,
                     out long totalPlaytimeSeconds,
                     out double? temporaryRolePreferenceWeight,
                     out error))
             {
                 return false;
             }
+
             if (!TryResolveDiscordPrivileges(
                     identity,
                     discordPrivilegeGroups,
                     managedDiscordGroups,
+                    pendingRevocations,
                     out error))
+            {
                 return false;
+            }
 
             string[] combinedPrivilegeGroups = steamPrivilegeGroups
                 .Union(discordPrivilegeGroups, StringComparer.OrdinalIgnoreCase)
@@ -123,6 +162,7 @@ namespace SmokyPluginV2.Privileges
                 DiscordPrivilegeGroups = discordPrivilegeGroups.ToArray(),
                 PrivilegeGroups = combinedPrivilegeGroups,
                 ManagedDiscordGroups = managedDiscordGroups.ToArray(),
+                PendingRevocations = pendingRevocations.ToArray(),
                 TotalPlaytimeSeconds = totalPlaytimeSeconds,
                 TemporaryRolePreferenceWeight = temporaryRolePreferenceWeight,
             };
@@ -130,11 +170,30 @@ namespace SmokyPluginV2.Privileges
             return true;
         }
 
+        public bool TryFinalizeRevocations(
+            IReadOnlyCollection<PendingPrivilegeRevocation> revocations,
+            out string error)
+        {
+            if (revocations == null || revocations.Count == 0)
+            {
+                error = null;
+                return true;
+            }
+
+            // Each persistent privilege source finalizes its own records here. No
+            // donation source exists yet, so a non-empty collection is rejected
+            // instead of silently losing a future PostgreSQL state transition.
+            error = "Для источника отзыва привилегии не настроена фиксация в PostgreSQL.";
+            return false;
+        }
+
         private bool TryResolveSteamPrivileges(
-            ResolvedIdentity identity,
+            PlayerAccessIdentity identity,
             EarnedPrivilegeSettings currentSettings,
             string groupName,
             ISet<string> result,
+            ISet<string> managedResult,
+            ICollection<PendingPrivilegeRevocation> pendingRevocations,
             out long totalPlaytimeSeconds,
             out double? temporaryRolePreferenceWeight,
             out string error)
@@ -158,8 +217,7 @@ namespace SmokyPluginV2.Privileges
             ReferralSettings referralSettings = currentSettings.Referrals ?? new ReferralSettings();
             if (referralSettings.IsEnabled)
             {
-                long qualificationSeconds =
-                    Math.Max(1, referralSettings.QualificationMinutes) * 60L;
+                long qualificationSeconds = Math.Max(1, referralSettings.QualificationMinutes) * 60L;
                 if (!database.TryGetReferralAccessState(
                         identity.PlayerId,
                         qualificationSeconds,
@@ -186,28 +244,25 @@ namespace SmokyPluginV2.Privileges
                 result.Add(groupName);
             }
 
+            // Steam-bound donations will also contribute active groups, managed
+            // groups and source-id revocations here when that source is added.
+
             error = null;
             return true;
         }
 
         private static bool TryResolveDiscordPrivileges(
-            ResolvedIdentity identity,
+            PlayerAccessIdentity identity,
             ISet<string> result,
             ISet<string> managedResult,
+            ICollection<PendingPrivilegeRevocation> pendingRevocations,
             out string error)
         {
-            // Discord-bound donations will be resolved here when that source is implemented.
+            // Active Discord-bound donations will be added to result. Expired,
+            // non-revoked donations will add their group to managedResult and a
+            // source-id entry to pendingRevocations when that source is implemented.
             error = null;
             return true;
-        }
-
-        private sealed class ResolvedIdentity
-        {
-            public long PlayerId { get; set; }
-
-            public string PlayerUserId { get; set; }
-
-            public ulong DiscordUserId { get; set; }
         }
     }
 }
