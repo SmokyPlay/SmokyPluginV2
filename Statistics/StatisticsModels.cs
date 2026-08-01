@@ -43,6 +43,7 @@ namespace SmokyPluginV2.Statistics
         public long SystemRebootsStarted { get; set; }
         public long TeslaKillsAs079 { get; set; }
         public long PinkCandiesEaten { get; set; }
+        public long BestSnakeScore { get; set; }
     }
 
     internal sealed class ServerStatisticsRecord

@@ -61,7 +61,8 @@ namespace SmokyPluginV2.Discord
                     $"**Активировано генераторов полностью:** {stats.GeneratorsActivated}\n" +
                     $"**Запущено перезагрузок:** {stats.SystemRebootsStarted}\n" +
                     $"**Убито теслой за SCP-079:** {stats.TeslaKillsAs079}\n" +
-                    $"**Съедено розовых конфет:** {stats.PinkCandiesEaten}"),
+                    $"**Съедено розовых конфет:** {stats.PinkCandiesEaten}\n" +
+                    $"**Рекорд в змейке:** {stats.BestSnakeScore}"),
             };
 
             string lastSeen = stats.LastSeenUtc.HasValue

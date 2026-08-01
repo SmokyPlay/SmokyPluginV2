@@ -8,7 +8,7 @@ Version 0.23.1 stores player statistics, server statistics, account links, refer
 
 - Persistent warning, kick and ban history and one-to-one Steam/Discord links stored in PostgreSQL.
 - Offline warnings are delivered by Discord DM when an account link is available; otherwise they remain pending and are queued as broadcasts when the player next joins the issuing server.
-- Compact aggregate player statistics, keyed by server and Steam ID; no per-round history rows are retained.
+- Compact aggregate player statistics, keyed by server and Steam ID, including the best Chaos device Snake score; no per-round history rows are retained.
 - Aggregate server statistics, including round outcomes, round duration, warhead detonations and separate MTF/Chaos main and reinforcement waves.
 - Discord `/stats` and `/server-stats` embeds, with global per-player privacy controlled by `/stats-privacy`.
 - Configurable recurring server-wide broadcasts.

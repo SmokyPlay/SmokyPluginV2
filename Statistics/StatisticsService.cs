@@ -8,6 +8,7 @@ namespace SmokyPluginV2.Statistics
 
     using Exiled.API.Enums;
     using Exiled.API.Features;
+    using Exiled.API.Features.Items;
     using Exiled.Events.EventArgs.Map;
     using Exiled.Events.EventArgs.Player;
     using Exiled.Events.EventArgs.Scp049;
@@ -274,6 +275,23 @@ namespace SmokyPluginV2.Statistics
                 chaos
                     ? reinforcement ? "chaos_reinforcement_waves" : "chaos_main_waves"
                     : reinforcement ? "mtf_reinforcement_waves" : "mtf_main_waves"));
+        }
+
+        public void OnSnakeScoreIncreased(ushort itemSerial, int score)
+        {
+            if (!IsRecording || score <= 0)
+                return;
+
+            Item item = Item.List.FirstOrDefault(candidate => candidate != null && candidate.Serial == itemSerial);
+            Player player = item?.Owner;
+            if (!IsRealPlayer(player))
+                return;
+
+            SafePlayerUpdate(
+                player.UserId,
+                player.Nickname,
+                new PlayerStatDelta().Max("best_snake_score", score),
+                DateTime.UtcNow);
         }
 
         private void OnWaitingForPlayers() => DeactivateRound();

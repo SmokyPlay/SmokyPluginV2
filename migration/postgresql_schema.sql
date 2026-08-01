@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS player_statistics (
     system_reboots_started bigint NOT NULL DEFAULT 0,
     tesla_kills_as_079 bigint NOT NULL DEFAULT 0,
     pink_candies_eaten bigint NOT NULL DEFAULT 0,
+    best_snake_score bigint NOT NULL DEFAULT 0,
     PRIMARY KEY (server_id, player_id),
     CONSTRAINT fk_player_statistics_server FOREIGN KEY (server_id)
         REFERENCES servers(id) ON DELETE CASCADE,
