@@ -7,6 +7,7 @@ namespace SmokyPluginV2.Commands
     using Exiled.API.Features;
 
     using SmokyPluginV2.AccountLinks;
+    using SmokyPluginV2.Database;
 
     [CommandHandler(typeof(ClientCommandHandler))]
     public sealed class LinkAccountCommand : ICommand
@@ -30,6 +31,12 @@ namespace SmokyPluginV2.Commands
             if (player is null || !player.IsConnected || player.IsHost)
             {
                 response = "Не удалось определить ваш игровой аккаунт. Повторите команду после полной авторизации на сервере.";
+                return false;
+            }
+
+            if (!PostgreSqlService.IsSteamUserId(player.UserId))
+            {
+                response = "Эта команда доступна только при входе в игру через Steam. Для управления существующей связкой используйте команды Discord.";
                 return false;
             }
 
@@ -85,6 +92,12 @@ namespace SmokyPluginV2.Commands
             if (player is null || !player.IsConnected || player.IsHost)
             {
                 response = "Не удалось определить ваш игровой аккаунт.";
+                return false;
+            }
+
+            if (!PostgreSqlService.IsSteamUserId(player.UserId))
+            {
+                response = "Эта команда доступна только при входе в игру через Steam. Для управления существующей связкой используйте команды Discord.";
                 return false;
             }
 

@@ -44,7 +44,10 @@ namespace SmokyPluginV2.Handlers
             if (!ev.IsAllowed || IsBanDisconnectReason(ev.Reason)) return;
             string moderatorUserId = SenderId(ev.CommandSender, ev.Player);
             bool automaticAfk = IsServerSender(ev.CommandSender) && IsAfkReason(ev.Reason);
-            pendingKicks[Key(ev.Target)] = new PendingKick(ev.Target, SenderText(ev.CommandSender, ev.Player), moderatorUserId, ev.Reason, automaticAfk);
+            string targetUserId = ev.Target?.UserId;
+            if (Plugin.Instance?.PlayerAccess?.TryGetResolvedSteamUserId(ev.Target, out string targetSteamUserId) == true)
+                targetUserId = targetSteamUserId;
+            pendingKicks[Key(ev.Target)] = new PendingKick(ev.Target, targetUserId, SenderText(ev.CommandSender, ev.Player), moderatorUserId, ev.Reason, automaticAfk);
         }
 
         private void OnKicked(KickedEventArgs ev)
@@ -54,7 +57,7 @@ namespace SmokyPluginV2.Handlers
             {
                 long? punishmentId = null;
                 if (!pending.IsAutomaticAfk)
-                    punishmentId = Store(pending.Target?.UserId, pending.Target?.Nickname, pending.ModeratorUserId, PunishmentType.Kick, pending.Reason, null);
+                    punishmentId = Store(pending.TargetUserId, pending.Target?.Nickname, pending.ModeratorUserId, PunishmentType.Kick, pending.Reason, null);
                 Log("Кик игрока", pending.Target, pending.Moderator, "не применяется", pending.Reason, punishmentId);
             }
             else
@@ -68,32 +71,70 @@ namespace SmokyPluginV2.Handlers
 
         private void OnBanned(BannedEventArgs ev)
         {
-            if (ev.Type == BanHandler.BanType.IP || ev.Details == null || !PostgreSqlService.IsSteamUserId(ev.Details.Id)) return;
+            if (ev.Details == null) return;
             string issuerText = ev.Player != null && !ev.Player.IsHost ? DiscordLogService.PlayerText(ev.Player) :
                 string.IsNullOrWhiteSpace(ev.Details.Issuer) ? "**Dedicated Server / неизвестно**" : DiscordLogService.Escape(ev.Details.Issuer);
             string reason = string.IsNullOrWhiteSpace(ev.Details.Reason) ? "не указана" : ev.Details.Reason;
             DateTime? expires = ev.Details.Expires > DateTime.UtcNow.Ticks ? new DateTime(ev.Details.Expires, DateTimeKind.Utc) : (DateTime?)null;
-            string moderatorId = SenderId(RemoteAdminCommandLoggingPatch.CurrentSender, ev.Player);
-            long? punishmentId = Store(ev.Details.Id, ev.Target?.Nickname ?? ev.Details.OriginalName, moderatorId, PunishmentType.Ban, reason, expires);
             string duration = expires.HasValue ? FormatDuration((long)Math.Ceiling((expires.Value - DateTime.UtcNow).TotalSeconds)) : "бессрочно";
+            if (ev.Type == BanHandler.BanType.IP)
+            {
+                string playerText = ev.Target != null
+                    ? DiscordLogService.PlayerText(ev.Target)
+                    : "**Неизвестный игрок**";
+                DiscordLogService.Current?.LogModeration("IP-бан игрока",
+                    $"**Игрок:** {playerText}\n" +
+                    $"**IP-адрес:** `{DiscordLogService.Escape(ev.Details.Id)}`\n" +
+                    $"**Модератор:** {issuerText}\n" +
+                    $"**Срок:** {duration}\n**Причина:** {DiscordLogService.Escape(reason)}");
+                return;
+            }
+
+            string moderatorId = SenderId(RemoteAdminCommandLoggingPatch.CurrentSender, ev.Player);
+            string targetUserId = ev.Target?.UserId ?? ev.Details.Id;
+            string targetNickname = ev.Target?.Nickname;
+            string displayUserId = ev.Details.Id;
+            if (ev.Target == null && TryResolvePunishmentSteamUserId(targetUserId, out string offlineSteamUserId))
+            {
+                targetUserId = offlineSteamUserId;
+                displayUserId = offlineSteamUserId;
+                targetNickname = GetLastKnownNickname(offlineSteamUserId);
+            }
+
+            long? punishmentId = Store(targetUserId, ev.Target != null ? targetNickname : null, moderatorId, PunishmentType.Ban, reason, expires);
             if (ev.Target != null) Log("Бан игрока", ev.Target, issuerText, duration, reason, punishmentId);
             else DiscordLogService.Current?.LogModeration("Бан игрока",
-                $"**Игрок:** **{DiscordLogService.Escape(ev.Details.OriginalName)}** (`{DiscordLogService.Escape(ev.Details.Id)}`)\n" +
+                $"**Игрок:** {OfflinePlayerText(targetNickname, displayUserId)}\n" +
                 $"**Модератор:** {issuerText}{PunishmentIdLine(punishmentId)}\n" +
                 $"**Срок:** {duration}\n**Причина:** {DiscordLogService.Escape(reason)}");
         }
 
         private void OnUnbanned(UnbannedEventArgs ev)
         {
-            if (ev.BanType != BanHandler.BanType.IP && punishments != null && PostgreSqlService.IsSteamUserId(ev.TargetId))
+            string targetLine;
+            if (ev.BanType == BanHandler.BanType.IP)
             {
-                if (!punishments.TryDeleteActiveBans(ev.TargetId, DateTime.UtcNow, out int deleted, out string error))
-                    Exiled.API.Features.Log.Error("[Moderation] Failed to update history after unban: " + error);
-                else if (deleted > 0)
-                    Exiled.API.Features.Log.Info($"[Moderation] Removed {deleted} active ban record(s) for {ev.TargetId}.");
+                targetLine = $"**IP-адрес:** `{DiscordLogService.Escape(ev.TargetId)}`";
             }
+            else if (TryResolvePunishmentSteamUserId(ev.TargetId, out string steamUserId))
+            {
+                string nickname = GetLastKnownNickname(steamUserId);
+                targetLine = $"**Игрок:** {OfflinePlayerText(nickname, steamUserId)}";
+                if (punishments != null)
+                {
+                    if (!punishments.TryDeleteActiveBans(steamUserId, DateTime.UtcNow, out int deleted, out string error))
+                        Exiled.API.Features.Log.Error("[Moderation] Failed to update history after unban: " + error);
+                    else if (deleted > 0)
+                        Exiled.API.Features.Log.Info($"[Moderation] Removed {deleted} active ban record(s) for {steamUserId}.");
+                }
+            }
+            else
+            {
+                targetLine = $"**Игрок:** {OfflinePlayerText(null, ev.TargetId)}";
+            }
+
             DiscordLogService.Current?.LogModeration("Игрок разбанен",
-                $"**Идентификатор:** `{DiscordLogService.Escape(ev.TargetId)}`\n**Тип блокировки:** `{ev.BanType}`\n**Модератор:** {SenderText(RemoteAdminCommandLoggingPatch.CurrentSender, null)}", false);
+                $"{targetLine}\n**Тип блокировки:** `{ev.BanType}`\n**Модератор:** {SenderText(RemoteAdminCommandLoggingPatch.CurrentSender, null)}", false);
         }
 
         private void OnIssuingMute(IssuingMuteEventArgs ev)
@@ -110,10 +151,14 @@ namespace SmokyPluginV2.Handlers
 
         private long? Store(string userId, string nickname, string moderatorId, PunishmentType type, string reason, DateTime? expires)
         {
-            if (punishments == null || !PostgreSqlService.IsSteamUserId(userId)) return null;
+            if (punishments == null || !TryResolvePunishmentSteamUserId(userId, out string steamUserId))
+            {
+                return null;
+            }
+
             PunishmentRecord record = new PunishmentRecord
             {
-                PlayerUserId = userId, PlayerNickname = nickname ?? string.Empty,
+                PlayerUserId = steamUserId, PlayerNickname = nickname ?? string.Empty,
                 ModeratorUserId = string.IsNullOrWhiteSpace(moderatorId) ? "server" : moderatorId,
                 Type = type, Reason = string.IsNullOrWhiteSpace(reason) ? "не указана" : reason,
                 IssuedAtUtc = DateTime.UtcNow, ExpiresAtUtc = expires,
@@ -127,6 +172,25 @@ namespace SmokyPluginV2.Handlers
             return record.Id;
         }
 
+        private static bool TryResolvePunishmentSteamUserId(string userId, out string steamUserId)
+        {
+            if (Plugin.Instance?.PlayerAccess?.TryGetResolvedSteamUserId(userId, out steamUserId) == true)
+                return true;
+
+            if (!PostgreSqlService.TryParseDiscordUserId(userId, out ulong discordUserId) ||
+                Plugin.Instance?.Database == null)
+            {
+                steamUserId = null;
+                return false;
+            }
+
+            bool resolved = Plugin.Instance.Database.TryGetPlayerUserId(
+                discordUserId,
+                out steamUserId,
+                out _);
+            return resolved && PostgreSqlService.IsSteamUserId(steamUserId);
+        }
+
         private static void Log(string action, Exiled.API.Features.Player target, string moderator, string duration, string reason, long? punishmentId = null, bool punishment = true) =>
             DiscordLogService.Current?.LogModeration(action,
                 $"**Игрок:** {DiscordLogService.PlayerText(target)}\n**Модератор:** {moderator}{PunishmentIdLine(punishmentId)}\n" +
@@ -134,6 +198,27 @@ namespace SmokyPluginV2.Handlers
 
         private static string PunishmentIdLine(long? punishmentId) =>
             punishmentId.HasValue ? $"\n**ID наказания:** `#{punishmentId.Value}`" : string.Empty;
+
+        private string GetLastKnownNickname(string steamUserId)
+        {
+            if (punishments == null)
+                return null;
+
+            if (!punishments.TryGetHistory(steamUserId, out PunishmentHistory history, out string error))
+            {
+                if (!string.IsNullOrWhiteSpace(error))
+                    Exiled.API.Features.Log.Error("[Moderation] Failed to resolve the last known nickname: " + error);
+                return null;
+            }
+
+            return history.PlayerExists && !string.IsNullOrWhiteSpace(history.PlayerNickname)
+                ? history.PlayerNickname
+                : null;
+        }
+
+        private static string OfflinePlayerText(string nickname, string userId) =>
+            $"**{DiscordLogService.Escape(string.IsNullOrWhiteSpace(nickname) ? "Неизвестный игрок" : nickname)}** " +
+            $"(`{DiscordLogService.Escape(userId)}`)";
 
         private static string SenderText(ICommandSender sender, Exiled.API.Features.Player fallback) => sender is CommandSender commandSender
             ? $"**{DiscordLogService.Escape(commandSender.Nickname)}** (`{DiscordLogService.Escape(commandSender.SenderId)}`)"
@@ -173,9 +258,10 @@ namespace SmokyPluginV2.Handlers
 
         private sealed class PendingKick
         {
-            public PendingKick(Exiled.API.Features.Player target, string moderator, string moderatorUserId, string reason, bool isAutomaticAfk)
-            { Target = target; Moderator = moderator; ModeratorUserId = moderatorUserId; Reason = reason; IsAutomaticAfk = isAutomaticAfk; }
+            public PendingKick(Exiled.API.Features.Player target, string targetUserId, string moderator, string moderatorUserId, string reason, bool isAutomaticAfk)
+            { Target = target; TargetUserId = targetUserId; Moderator = moderator; ModeratorUserId = moderatorUserId; Reason = reason; IsAutomaticAfk = isAutomaticAfk; }
             public Exiled.API.Features.Player Target { get; }
+            public string TargetUserId { get; }
             public string Moderator { get; }
             public string ModeratorUserId { get; }
             public string Reason { get; }

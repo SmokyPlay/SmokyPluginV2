@@ -41,7 +41,8 @@ namespace SmokyPluginV2.Commands
             bool online = target != null && target.IsConnected && !target.IsHost;
             if (online)
             {
-                userId = target.UserId;
+                if (Plugin.Instance?.PlayerAccess?.TryGetResolvedSteamUserId(target, out userId) != true)
+                { response = "Для Discord-аккаунта игрока не найдена связка со Steam."; return false; }
                 nickname = target.Nickname;
                 if (!moderator.IsServer && moderator.KickPower < ModerationCommandHelpers.GetRequiredKickPower(target))
                 { response = $"Недостаточно прав для выдачи предупреждения игроку {target.Nickname}."; return false; }
@@ -162,7 +163,11 @@ namespace SmokyPluginV2.Commands
             string query = NormalizePlayerSelector(arguments.Array[arguments.Offset]);
             Player player = Player.Get(query);
             if (player != null && player.IsConnected && !player.IsHost)
-            { userId = player.UserId; displayName = player.Nickname; error = null; return true; }
+            {
+                if (Plugin.Instance?.PlayerAccess?.TryGetResolvedSteamUserId(player, out userId) != true)
+                { error = "Для Discord-аккаунта игрока не найдена связка со Steam."; return false; }
+                displayName = player.Nickname; error = null; return true;
+            }
             userId = NormalizeUserId(query);
             if (!PostgreSqlService.IsSteamUserId(userId)) { error = "Игрок не найден. Для оффлайн-игрока укажите точный SteamID64."; return false; }
             displayName = "оффлайн-игрок"; error = null; return true;
@@ -252,13 +257,16 @@ namespace SmokyPluginV2.Commands
         private static string FormatDiscordModerator(PunishmentRecord record)
         {
             if (string.Equals(record.ModeratorUserId, "server", StringComparison.OrdinalIgnoreCase)) return "Dedicated Server";
+            if (!string.IsNullOrWhiteSpace(record.ModeratorUserId) && record.ModeratorUserId.EndsWith("@discord", StringComparison.OrdinalIgnoreCase))
+            {
+                string discordId = record.ModeratorUserId.Substring(0, record.ModeratorUserId.Length - 8);
+                return $"<@{discordId}> (`{DiscordLogService.Escape(discordId)}`)";
+            }
             if (!string.IsNullOrWhiteSpace(record.ModeratorSteamId))
             {
                 string nickname = string.IsNullOrWhiteSpace(record.ModeratorNickname) ? "Неизвестный модератор" : DiscordLogService.Escape(record.ModeratorNickname);
                 return $"**{nickname}** (`{DiscordLogService.Escape(record.ModeratorSteamId)}`)";
             }
-            if (!string.IsNullOrWhiteSpace(record.ModeratorUserId) && record.ModeratorUserId.EndsWith("@discord", StringComparison.OrdinalIgnoreCase))
-                return $"<@{record.ModeratorUserId.Substring(0, record.ModeratorUserId.Length - 8)}>";
             return $"`{DiscordLogService.Escape(record.ModeratorUserId)}`";
         }
 

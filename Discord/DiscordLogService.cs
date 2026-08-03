@@ -849,12 +849,16 @@ namespace SmokyPluginV2.Discord
         {
             string id = record.ModeratorUserId;
             if (string.Equals(id, "server", StringComparison.OrdinalIgnoreCase)) return "Dedicated Server";
+            if (!string.IsNullOrWhiteSpace(id) && id.EndsWith("@discord", StringComparison.OrdinalIgnoreCase))
+            {
+                string discordId = id.Substring(0, id.Length - 8);
+                return $"<@{discordId}> (`{Escape(discordId)}`)";
+            }
             if (!string.IsNullOrWhiteSpace(record.ModeratorSteamId))
             {
                 string nickname = string.IsNullOrWhiteSpace(record.ModeratorNickname) ? "Неизвестный модератор" : Escape(record.ModeratorNickname);
                 return $"**{nickname}** (`{Escape(record.ModeratorSteamId)}`)";
             }
-            if (!string.IsNullOrWhiteSpace(id) && id.EndsWith("@discord", StringComparison.OrdinalIgnoreCase)) return $"<@{id.Substring(0, id.Length - 8)}>";
             return $"`{Escape(id)}`";
         }
 

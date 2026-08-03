@@ -35,10 +35,15 @@ namespace SmokyPluginV2.Commands
             if (player == null ||
                 !player.IsConnected ||
                 player.IsHost ||
-                player.IsNPC ||
-                !Database.PostgreSqlService.IsSteamUserId(player.UserId))
+                player.IsNPC)
             {
                 response = "Не удалось определить ваш Steam-аккаунт.";
+                return false;
+            }
+
+            if (Plugin.Instance?.PlayerAccess?.TryGetResolvedSteamUserId(player, out string steamUserId) != true)
+            {
+                response = "Для вашего Discord-аккаунта не найдена связка со Steam.";
                 return false;
             }
 
@@ -59,7 +64,7 @@ namespace SmokyPluginV2.Commands
             long liveSeconds = statistics?.GetUnpersistedPlaytimeSeconds(player.UserId) ?? 0;
             string code = arguments.Array[arguments.Offset];
             bool accepted = referrals.TryAccept(
-                player.UserId,
+                steamUserId,
                 code,
                 liveSeconds,
                 out response);

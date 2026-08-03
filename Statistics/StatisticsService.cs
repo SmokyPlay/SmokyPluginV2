@@ -45,6 +45,8 @@ namespace SmokyPluginV2.Statistics
         private readonly Dictionary<string, PendingEscape> pendingEscapes = new Dictionary<string, PendingEscape>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, Scp106AttackCredit> scp106AttackCredits = new Dictionary<string, Scp106AttackCredit>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<Generator, string> generatorActivators = new Dictionary<Generator, string>();
+        private readonly Dictionary<string, string> statisticsSessionsBySteamUserId =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private DateTime roundStartedUtc;
         private bool roundActive;
         private bool recordingPaused;
@@ -84,6 +86,41 @@ namespace SmokyPluginV2.Statistics
             }
 
             return ElapsedSeconds(state.RoleIntervalStartedUtc.Value, DateTime.UtcNow);
+        }
+
+        internal void OnIdentityResolved(Player player, string steamUserId)
+        {
+            if (!IsConnectedPlayer(player) || !PostgreSqlService.IsSteamUserId(steamUserId))
+                return;
+
+            RegisterStatisticsSession(player, steamUserId, DateTime.UtcNow);
+        }
+
+        internal void OnIdentityRemoved(Player player)
+        {
+            if (player == null || string.IsNullOrWhiteSpace(player.UserId))
+                return;
+
+            players.TryGetValue(player.UserId, out RoundPlayerState state);
+            string steamUserId = state?.UserId ?? ResolveSteamUserIdOrNull(player.UserId);
+            if (string.IsNullOrWhiteSpace(steamUserId))
+                return;
+            if (!statisticsSessionsBySteamUserId.TryGetValue(steamUserId, out string activeSession) ||
+                !string.Equals(activeSession, player.UserId, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            DateTime now = DateTime.UtcNow;
+            if (IsRecording && state != null)
+                FlushStateIntervals(state, now, true);
+            players.Remove(player.UserId);
+            pendingEscapes.Remove(player.UserId);
+            scp106AttackCredits.Remove(player.UserId);
+            activePocketStarts.TryRemove(PostgreSqlService.NormalizeSteamId(steamUserId), out _);
+            statisticsSessionsBySteamUserId.Remove(steamUserId);
+            SafePlayerUpdate(steamUserId, player.Nickname, new PlayerStatDelta(), now);
+            ActivateReplacementSession(steamUserId, player.UserId, now);
         }
 
         public void Register()
@@ -140,6 +177,7 @@ namespace SmokyPluginV2.Statistics
             WarheadHandlers.Stopping -= OnWarheadStopping;
             WarheadHandlers.Detonated -= OnWarheadDetonated;
             DeactivateRound();
+            statisticsSessionsBySteamUserId.Clear();
             writeQueue.CompleteAdding();
             bool writerStopped = writerThread.Join(TimeSpan.FromSeconds(10));
             if (!writerStopped)
@@ -341,7 +379,7 @@ namespace SmokyPluginV2.Statistics
                     .Increment("rounds_completed")
                     .Max("best_human_kills_round", state.HumanKillsThisRound)
                     .Max("best_scp_kills_round", state.ScpKillsThisRound);
-                SafePlayerUpdate(player.UserId, player.Nickname, delta, now);
+                SafePlayerUpdate(state.UserId, player.Nickname, delta, now);
             }
 
             long duration = Math.Max(0L, (long)Math.Round((now - roundStartedUtc).TotalSeconds));
@@ -364,26 +402,39 @@ namespace SmokyPluginV2.Statistics
 
         private void OnVerified(VerifiedEventArgs ev)
         {
-            if (!IsRealPlayer(ev.Player))
+            if (!TryResolveSteamUserId(ev.Player, out string steamUserId))
                 return;
-            SafePlayerUpdate(ev.Player.UserId, ev.Player.Nickname, new PlayerStatDelta(), DateTime.UtcNow);
-            if (IsRecording)
-                ResumeState(GetState(ev.Player), ev.Player, DateTime.UtcNow);
+
+            RegisterStatisticsSession(ev.Player, steamUserId, DateTime.UtcNow);
         }
 
         private void OnLeft(LeftEventArgs ev)
         {
-            if (!IsRealPlayer(ev.Player))
+            if (ev.Player == null || string.IsNullOrWhiteSpace(ev.Player.UserId))
                 return;
-            DateTime now = DateTime.UtcNow;
-            if (IsRecording && players.TryGetValue(ev.Player.UserId, out RoundPlayerState state))
+
+            string sessionUserId = ev.Player.UserId;
+            string steamUserId = players.TryGetValue(sessionUserId, out RoundPlayerState existingState)
+                ? existingState.UserId
+                : ResolveSteamUserIdOrNull(sessionUserId);
+            if (string.IsNullOrWhiteSpace(steamUserId) ||
+                !statisticsSessionsBySteamUserId.TryGetValue(steamUserId, out string activeSession) ||
+                !string.Equals(activeSession, sessionUserId, StringComparison.OrdinalIgnoreCase))
             {
-                FlushStateIntervals(state, now, true);
-                players.Remove(ev.Player.UserId);
+                return;
             }
-            activePocketStarts.TryRemove(PostgreSqlService.NormalizeSteamId(ev.Player.UserId), out _);
-            scp106AttackCredits.Remove(ev.Player.UserId);
-            SafePlayerUpdate(ev.Player.UserId, ev.Player.Nickname, new PlayerStatDelta(), now);
+
+            DateTime now = DateTime.UtcNow;
+            if (IsRecording && existingState != null)
+            {
+                FlushStateIntervals(existingState, now, true);
+            }
+            players.Remove(sessionUserId);
+            activePocketStarts.TryRemove(PostgreSqlService.NormalizeSteamId(steamUserId), out _);
+            scp106AttackCredits.Remove(sessionUserId);
+            SafePlayerUpdate(steamUserId, ev.Player.Nickname, new PlayerStatDelta(), now);
+            statisticsSessionsBySteamUserId.Remove(steamUserId);
+            ActivateReplacementSession(steamUserId, sessionUserId, now);
         }
 
         private void OnHurting(HurtingEventArgs ev)
@@ -557,7 +608,7 @@ namespace SmokyPluginV2.Statistics
             state.InPocket = true;
             state.PocketSeconds = 0;
             state.PocketIntervalStartedUtc = now;
-            activePocketStarts[PostgreSqlService.NormalizeSteamId(player.UserId)] = now;
+            activePocketStarts[PostgreSqlService.NormalizeSteamId(state.UserId)] = now;
             if (scp106AttackCredits.TryGetValue(player.UserId, out Scp106AttackCredit credit))
                 credit.PocketEntryConfirmed = true;
             SafePlayerUpdate(player.UserId, player.Nickname, new PlayerStatDelta().Increment("pocket_entries"), now);
@@ -786,7 +837,12 @@ namespace SmokyPluginV2.Statistics
         {
             if (!players.TryGetValue(player.UserId, out RoundPlayerState state))
             {
-                state = new RoundPlayerState { UserId = player.UserId, Nickname = player.Nickname, Category = Classify(player.Role.Type) };
+                state = new RoundPlayerState
+                {
+                    UserId = ResolveSteamUserIdOrNull(player.UserId) ?? player.UserId,
+                    Nickname = player.Nickname,
+                    Category = Classify(player.Role.Type),
+                };
                 players[player.UserId] = state;
             }
             else
@@ -809,43 +865,51 @@ namespace SmokyPluginV2.Statistics
 
         private void ResetRoundTracking(string userId, Player onlinePlayer, DateTime now)
         {
-            players.Remove(userId);
-            pendingEscapes.Remove(userId);
-            scp106AttackCredits.Remove(userId);
+            string sessionUserId = statisticsSessionsBySteamUserId.TryGetValue(userId, out string activeSessionUserId)
+                ? activeSessionUserId
+                : onlinePlayer?.UserId ?? userId;
+            Player trackedPlayer = Player.Get(sessionUserId) ?? onlinePlayer;
+            players.Remove(sessionUserId);
+            pendingEscapes.Remove(sessionUserId);
+            scp106AttackCredits.Remove(sessionUserId);
             foreach (Generator generator in generatorActivators
-                .Where(pair => string.Equals(pair.Value, userId, StringComparison.OrdinalIgnoreCase))
+                .Where(pair => string.Equals(pair.Value, sessionUserId, StringComparison.OrdinalIgnoreCase))
                 .Select(pair => pair.Key)
                 .ToList())
             {
                 generatorActivators.Remove(generator);
             }
 
-            if (string.Equals(lastWarheadStarterUserId, userId, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(lastWarheadStarterUserId, sessionUserId, StringComparison.OrdinalIgnoreCase))
                 lastWarheadStarterUserId = null;
-            if (string.Equals(rebootStarterUserId, userId, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(rebootStarterUserId, sessionUserId, StringComparison.OrdinalIgnoreCase))
                 rebootStarterUserId = null;
-            if (string.Equals(lastTesla079UserId, userId, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(lastTesla079UserId, sessionUserId, StringComparison.OrdinalIgnoreCase))
                 lastTesla079UserId = null;
 
-            if (IsRecording && IsRealPlayer(onlinePlayer))
-                ResumeState(GetState(onlinePlayer), onlinePlayer, now);
+            if (IsRecording && IsRealPlayer(trackedPlayer))
+                ResumeState(GetState(trackedPlayer), trackedPlayer, now);
         }
 
         private void SafePlayerUpdate(string userId, string nickname, PlayerStatDelta delta, DateTime now)
         {
+            string steamUserId = ResolveSteamUserIdOrNull(userId);
+            if (string.IsNullOrWhiteSpace(steamUserId))
+                return;
+
             long addedPlaytimeSeconds = GetAddedPlaytimeSeconds(delta);
             EnqueueWrite(
                 () =>
                 {
-                    database.UpdatePlayerStatistics(userId, nickname, delta, now);
+                    database.UpdatePlayerStatistics(steamUserId, nickname, delta, now);
                     if (addedPlaytimeSeconds > 0)
                     {
                         Plugin.Instance?.Referrals?.OnPlaytimePersisted(
-                            userId,
+                            steamUserId,
                             addedPlaytimeSeconds);
                     }
                 },
-                "player " + userId);
+                "player " + steamUserId);
         }
 
         private void SafeServerUpdate(ServerStatDelta delta)
@@ -874,14 +938,87 @@ namespace SmokyPluginV2.Statistics
             }
         }
 
-        private static IEnumerable<Player> OnlinePlayers() => Player.List.Where(IsRealPlayer);
+        private IEnumerable<Player> OnlinePlayers() => Player.List.Where(IsRealPlayer);
 
-        private static bool IsRealPlayer(Player player) =>
-            player != null &&
-            player.IsConnected &&
-            !player.IsHost &&
-            !player.IsNPC &&
-            PostgreSqlService.IsSteamUserId(player.UserId);
+        private bool IsRealPlayer(Player player)
+        {
+            if (!TryResolveSteamUserId(player, out string steamUserId))
+                return false;
+
+            return statisticsSessionsBySteamUserId.TryGetValue(steamUserId, out string sessionUserId) &&
+                string.Equals(sessionUserId, player.UserId, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsConnectedPlayer(Player player) =>
+            player != null && player.IsConnected && !player.IsHost && !player.IsNPC;
+
+        private static bool TryResolveSteamUserId(Player player, out string steamUserId)
+        {
+            steamUserId = null;
+            if (!IsConnectedPlayer(player))
+                return false;
+
+            if (PostgreSqlService.IsSteamUserId(player.UserId))
+            {
+                steamUserId = PostgreSqlService.ToExiledUserId(
+                    PostgreSqlService.NormalizeSteamId(player.UserId));
+                return true;
+            }
+
+            return Plugin.Instance?.PlayerAccess?.TryGetResolvedSteamUserId(player, out steamUserId) == true;
+        }
+
+        private static string ResolveSteamUserIdOrNull(string userId)
+        {
+            if (PostgreSqlService.IsSteamUserId(userId))
+                return PostgreSqlService.ToExiledUserId(PostgreSqlService.NormalizeSteamId(userId));
+
+            return Plugin.Instance?.PlayerAccess?.TryGetResolvedSteamUserId(userId, out string steamUserId) == true
+                ? steamUserId
+                : null;
+        }
+
+        private void RegisterStatisticsSession(Player player, string steamUserId, DateTime now)
+        {
+            if (!IsConnectedPlayer(player))
+                return;
+
+            if (statisticsSessionsBySteamUserId.TryGetValue(steamUserId, out string currentSession))
+            {
+                if (string.Equals(currentSession, player.UserId, StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                bool currentIsSteam = PostgreSqlService.IsSteamUserId(currentSession);
+                bool incomingIsSteam = PostgreSqlService.IsSteamUserId(player.UserId);
+                if (currentIsSteam || !incomingIsSteam)
+                    return;
+
+                if (players.TryGetValue(currentSession, out RoundPlayerState previousState))
+                {
+                    if (IsRecording)
+                        FlushStateIntervals(previousState, now, true);
+                    players.Remove(currentSession);
+                }
+            }
+
+            statisticsSessionsBySteamUserId[steamUserId] = player.UserId;
+            SafePlayerUpdate(steamUserId, player.Nickname, new PlayerStatDelta(), now);
+            if (IsRecording)
+                ResumeState(GetState(player), player, now);
+        }
+
+        private void ActivateReplacementSession(string steamUserId, string leavingSessionUserId, DateTime now)
+        {
+            Player replacement = Player.List
+                .Where(player => IsConnectedPlayer(player) &&
+                    !string.Equals(player.UserId, leavingSessionUserId, StringComparison.OrdinalIgnoreCase) &&
+                    TryResolveSteamUserId(player, out string candidateSteamUserId) &&
+                    string.Equals(candidateSteamUserId, steamUserId, StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(player => PostgreSqlService.IsSteamUserId(player.UserId))
+                .FirstOrDefault();
+            if (replacement != null)
+                RegisterStatisticsSession(replacement, steamUserId, now);
+        }
 
         private static long ElapsedSeconds(DateTime start, DateTime end) => Math.Max(0L, (long)Math.Round((end - start).TotalSeconds));
 

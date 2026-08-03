@@ -1181,11 +1181,12 @@ namespace SmokyPluginV2.Database
         public static string NormalizeSteamId(string userId)
         {
             string normalized = (userId ?? string.Empty).Trim();
+            if (!IsSteamUserId(normalized))
+                throw new ArgumentException("A valid SteamID64 with no provider or the @steam provider is required.", nameof(userId));
+
             int separator = normalized.IndexOf('@');
             if (separator >= 0)
                 normalized = normalized.Substring(0, separator);
-            if (string.IsNullOrWhiteSpace(normalized))
-                throw new ArgumentException("Steam ID is empty.", nameof(userId));
             return normalized;
         }
 
@@ -1193,12 +1194,41 @@ namespace SmokyPluginV2.Database
         {
             string normalized = (userId ?? string.Empty).Trim();
             int separator = normalized.IndexOf('@');
+            if (separator >= 0 &&
+                !normalized.Substring(separator).Equals("@steam", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
             if (separator >= 0)
                 normalized = normalized.Substring(0, separator);
 
             return normalized.Length == 17 &&
                 normalized.All(character => character >= '0' && character <= '9');
         }
+
+        public static bool TryParseDiscordUserId(string userId, out ulong discordUserId)
+        {
+            discordUserId = 0;
+            string normalized = (userId ?? string.Empty).Trim();
+            int separator = normalized.IndexOf('@');
+            if (separator <= 0 ||
+                !normalized.Substring(separator).Equals("@discord", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            string id = normalized.Substring(0, separator);
+            return id.Length >= 17 && id.Length <= 20 &&
+                id.All(character => character >= '0' && character <= '9') &&
+                ulong.TryParse(id, NumberStyles.None, CultureInfo.InvariantCulture, out discordUserId) &&
+                discordUserId != 0;
+        }
+
+        public static string ToDiscordUserId(ulong discordUserId) =>
+            discordUserId == 0
+                ? throw new ArgumentOutOfRangeException(nameof(discordUserId))
+                : discordUserId.ToString(CultureInfo.InvariantCulture) + "@discord";
 
         public static string ToExiledUserId(string steamId) => NormalizeSteamId(steamId) + "@steam";
 
@@ -1284,6 +1314,7 @@ namespace SmokyPluginV2.Database
             ApplySchemaMigration(connection, 7, "Unified punishment history", ApplyUnifiedPunishmentHistoryMigration);
             ApplySchemaMigration(connection, 8, "Warning delivery tracking", ApplyWarningDeliveryTrackingMigration);
             ApplySchemaMigration(connection, 9, "Snake high score", ApplySnakeHighScoreMigration);
+            ApplySchemaMigration(connection, 10, "Remove offline ban nickname placeholders", ApplyOfflineBanNicknameCleanupMigration);
         }
 
         private static void ApplySchemaMigration(
@@ -1369,6 +1400,16 @@ namespace SmokyPluginV2.Database
                 alter.ExecuteNonQuery();
         }
 
+        private static void ApplyOfflineBanNicknameCleanupMigration(
+            NpgsqlConnection connection,
+            NpgsqlTransaction transaction)
+        {
+            using (NpgsqlCommand cleanup = CreateCommand(connection,
+                "UPDATE players SET last_nickname=NULL,updated_at=CURRENT_TIMESTAMP " +
+                "WHERE LOWER(BTRIM(last_nickname))='unknown - offline ban'", transaction))
+                cleanup.ExecuteNonQuery();
+        }
+
         private long ResolveServer()
         {
             using (NpgsqlConnection connection = OpenConnection())
@@ -1437,7 +1478,10 @@ namespace SmokyPluginV2.Database
                 "updated_at=CURRENT_TIMESTAMP RETURNING id", transaction))
             {
                 command.Parameters.AddWithValue("@steam_id", NormalizeSteamId(playerUserId));
-                command.Parameters.AddWithValue("@nickname", nickname ?? string.Empty);
+                command.Parameters.AddWithValue(
+                    "@nickname",
+                    NpgsqlTypes.NpgsqlDbType.Varchar,
+                    string.IsNullOrWhiteSpace(nickname) ? (object)DBNull.Value : nickname);
                 return Convert.ToInt64(command.ExecuteScalar(), CultureInfo.InvariantCulture);
             }
         }

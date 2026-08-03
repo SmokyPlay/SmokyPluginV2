@@ -7,6 +7,7 @@ namespace SmokyPluginV2.Moderation
     using Exiled.API.Features;
     using Exiled.Events.EventArgs.Player;
 
+    using SmokyPluginV2.Database;
     using SmokyPluginV2.Discord;
 
     using PlayerEvents = Exiled.Events.Handlers.Player;
@@ -89,9 +90,28 @@ namespace SmokyPluginV2.Moderation
             if (!isRegistered || player == null || !player.IsConnected || !NotificationsEnabled())
                 return;
 
-            if (!punishments.TryGetPendingWarningNotifications(player.UserId, out IReadOnlyList<PunishmentRecord> pending, out string error))
+            if (!TryResolveSteamUserId(player, out string steamUserId))
+                return;
+
+            NotifyPending(player, steamUserId);
+        }
+
+        internal void OnIdentityResolved(Player player, string steamUserId)
+        {
+            if (!isRegistered || player == null || !player.IsConnected || !NotificationsEnabled() ||
+                !PostgreSqlService.IsSteamUserId(steamUserId))
             {
-                Log.Error($"[Moderation] Could not load pending warnings for {player.UserId}: {error}");
+                return;
+            }
+
+            NotifyPending(player, steamUserId);
+        }
+
+        private void NotifyPending(Player player, string steamUserId)
+        {
+            if (!punishments.TryGetPendingWarningNotifications(steamUserId, out IReadOnlyList<PunishmentRecord> pending, out string error))
+            {
+                Log.Error($"[Moderation] Could not load pending warnings for {steamUserId}: {error}");
                 return;
             }
 
@@ -106,6 +126,19 @@ namespace SmokyPluginV2.Moderation
                 if (TryQueueBroadcast(player, warning, moderator, false))
                     MarkNotified(warning.Id);
             }
+        }
+
+        private static bool TryResolveSteamUserId(Player player, out string steamUserId)
+        {
+            steamUserId = null;
+            if (PostgreSqlService.IsSteamUserId(player?.UserId))
+            {
+                steamUserId = PostgreSqlService.ToExiledUserId(
+                    PostgreSqlService.NormalizeSteamId(player.UserId));
+                return true;
+            }
+
+            return Plugin.Instance?.PlayerAccess?.TryGetResolvedSteamUserId(player, out steamUserId) == true;
         }
 
         private static bool TryQueueBroadcast(

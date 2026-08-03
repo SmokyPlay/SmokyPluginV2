@@ -1,9 +1,11 @@
 namespace SmokyPluginV2.Handlers
 {
     using System;
+    using System.Collections.Generic;
 
     using MEC;
 
+    using Exiled.API.Enums;
     using Exiled.Events.EventArgs.Map;
     using Exiled.Events.EventArgs.Player;
     using Exiled.Events.EventArgs.Scp079;
@@ -28,6 +30,9 @@ namespace SmokyPluginV2.Handlers
 
     internal sealed class DiscordGameEventHandler
     {
+        private static bool roundStartLogged;
+        private readonly HashSet<int> leavingPlayerIds = new HashSet<int>();
+
         private DiscordLogService Logs => DiscordLogService.Current;
 
         private DiscordEventLogs Config => DiscordLogService.EventSettings;
@@ -43,7 +48,7 @@ namespace SmokyPluginV2.Handlers
             PlayerEvents.Verified += OnVerified;
             PlayerEvents.Left += OnLeft;
             PlayerEvents.Hurting += OnHurting;
-            PlayerEvents.Died += OnDied;
+            PlayerEvents.Dying += OnDying;
             PlayerEvents.ChangingRole += OnChangingRole;
             PlayerEvents.ChangingGroup += OnChangingGroup;
             PlayerEvents.ChangingItem += OnChangingItem;
@@ -61,7 +66,6 @@ namespace SmokyPluginV2.Handlers
             PlayerEvents.InteractingElevator += OnInteractingElevator;
             PlayerEvents.InteractingLocker += OnInteractingLocker;
             PlayerEvents.TriggeringTesla += OnTriggeringTesla;
-            PlayerEvents.ActivatingWarheadPanel += OnActivatingWarheadPanel;
             PlayerEvents.UnlockingGenerator += OnUnlockingGenerator;
             PlayerEvents.OpeningGenerator += OnOpeningGenerator;
             PlayerEvents.ClosingGenerator += OnClosingGenerator;
@@ -99,7 +103,7 @@ namespace SmokyPluginV2.Handlers
             PlayerEvents.Verified -= OnVerified;
             PlayerEvents.Left -= OnLeft;
             PlayerEvents.Hurting -= OnHurting;
-            PlayerEvents.Died -= OnDied;
+            PlayerEvents.Dying -= OnDying;
             PlayerEvents.ChangingRole -= OnChangingRole;
             PlayerEvents.ChangingGroup -= OnChangingGroup;
             PlayerEvents.ChangingItem -= OnChangingItem;
@@ -117,7 +121,6 @@ namespace SmokyPluginV2.Handlers
             PlayerEvents.InteractingElevator -= OnInteractingElevator;
             PlayerEvents.InteractingLocker -= OnInteractingLocker;
             PlayerEvents.TriggeringTesla -= OnTriggeringTesla;
-            PlayerEvents.ActivatingWarheadPanel -= OnActivatingWarheadPanel;
             PlayerEvents.UnlockingGenerator -= OnUnlockingGenerator;
             PlayerEvents.OpeningGenerator -= OnOpeningGenerator;
             PlayerEvents.ClosingGenerator -= OnClosingGenerator;
@@ -160,18 +163,25 @@ namespace SmokyPluginV2.Handlers
 
         private void OnWaitingForPlayers()
         {
+            roundStartLogged = false;
+            leavingPlayerIds.Clear();
             Game(Config.WaitingForPlayers, ":hourglass: Waiting for players...");
             Logs?.UpdatePresence(0);
         }
 
-        private void OnRoundStarted()
+        internal static void LogRoundStartingEarly()
         {
-            if (!Config.RoundStarted)
+            DiscordLogService logs = DiscordLogService.Current;
+            DiscordEventLogs config = DiscordLogService.EventSettings;
+            if (roundStartLogged || logs is null || config?.RoundStarted != true)
                 return;
 
+            roundStartLogged = true;
             GameLog.Info($"[Discord Events] Round started with {GameServer.PlayerCount} player(s).");
-            Game(true, $":arrow_forward: Round starting: {GameServer.PlayerCount} players in round.");
+            logs.LogGameLine($":arrow_forward: Round starting: {GameServer.PlayerCount} players in round.");
         }
+
+        private void OnRoundStarted() => LogRoundStartingEarly();
 
         private void OnRoundEnded(RoundEndedEventArgs ev) =>
             Game(Config.RoundEnded, $":stop_button: Round ended: {ev.LeadingTeam} - Players online {GameServer.PlayerCount}/{GameServer.MaxPlayerCount}.");
@@ -185,6 +195,7 @@ namespace SmokyPluginV2.Handlers
 
         private void OnVerified(VerifiedEventArgs ev)
         {
+            leavingPlayerIds.Remove(ev.Player.Id);
             string address = Plugin.Instance.Config.Discord.LogIpAddresses ? ev.Player.IPAddress : "REDACTED";
             Game(Config.PlayerJoined, $":arrow_right: **{DiscordLogService.Escape(ev.Player.Nickname)} ({DiscordLogService.Escape(ev.Player.UserId)}) [{DiscordLogService.Escape(address)}] has joined the game.**");
             Logs?.UpdatePresence();
@@ -192,6 +203,9 @@ namespace SmokyPluginV2.Handlers
 
         private void OnLeft(LeftEventArgs ev)
         {
+            if (ev.Player is not null)
+                leavingPlayerIds.Add(ev.Player.Id);
+
             Game(Config.PlayerLeft, $":arrow_left: **{P(ev.Player)} has left the server.**");
             Logs?.UpdatePresence(Math.Max(0, GameServer.PlayerCount - 1));
         }
@@ -199,11 +213,24 @@ namespace SmokyPluginV2.Handlers
         private void OnHurting(HurtingEventArgs ev) =>
             Game(Config.PlayerHurt, $":crossed_swords: **{P(ev.Attacker)} has damaged {P(ev.Player)} for {ev.DamageHandler.Damage:0.##} with {ev.DamageHandler.Type}.**");
 
-        private void OnDied(DiedEventArgs ev) =>
-            Game(Config.PlayerDied, $":skull_crossbones: **{P(ev.Attacker)} killed {P(ev.Player)} with {ev.DamageHandler.Type}.**");
+        private void OnDying(DyingEventArgs ev)
+        {
+            if (!ev.IsAllowed || IsLeaving(ev.Player))
+                return;
 
-        private void OnChangingRole(ChangingRoleEventArgs ev) =>
+            Game(Config.PlayerDied, $":skull_crossbones: **{P(ev.Attacker)} killed {P(ev.Player)} with {ev.DamageHandler.Type}.**");
+        }
+
+        private void OnChangingRole(ChangingRoleEventArgs ev)
+        {
+            if (!ev.IsAllowed || IsLeaving(ev.Player) || ev.Reason == SpawnReason.Destroyed)
+                return;
+
             Game(Config.PlayerChangedRole, $":mens: {P(ev.Player)} has been changed to a {ev.NewRole}.");
+        }
+
+        private bool IsLeaving(GamePlayer player) =>
+            player is not null && leavingPlayerIds.Contains(player.Id);
 
         private void OnChangingGroup(ChangingGroupEventArgs ev)
         {
@@ -264,8 +291,15 @@ namespace SmokyPluginV2.Handlers
         private void OnTriggeringTesla(TriggeringTeslaEventArgs ev) =>
             Game(Config.PlayerTriggeredTesla, $":zap: {P(ev.Player)} has triggered a tesla gate.");
 
-        private void OnActivatingWarheadPanel(ActivatingWarheadPanelEventArgs ev) =>
-            Game(Config.PlayerAccessedWarheadPanel, $":key: {P(ev.Player)} has accessed the Alpha-warhead detonation button cover.");
+        internal static void LogSuccessfulWarheadPanelAccess(GamePlayer player)
+        {
+            DiscordLogService logs = DiscordLogService.Current;
+            DiscordEventLogs config = DiscordLogService.EventSettings;
+            if (logs is null || config?.PlayerAccessedWarheadPanel != true)
+                return;
+
+            logs.LogGameLine($":key: {P(player)} has accessed the Alpha-warhead detonation button cover.");
+        }
 
         private void OnUnlockingGenerator(UnlockingGeneratorEventArgs ev) =>
             Game(Config.GeneratorUnlocked, $":unlock: {P(ev.Player)} has unlocked a generator door.");

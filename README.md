@@ -2,11 +2,12 @@
 
 EXILED 9.14.2 plugin for SCP: Secret Laboratory 14.2.7.
 
-Version 0.23.1 stores player statistics, server statistics, account links, referrals and moderation history in PostgreSQL. Multiple SCP:SL instances share one database configuration and are separated automatically by their game ports.
+Version 0.25.3 stores player statistics, server statistics, account links, referrals and moderation history in PostgreSQL. The access synchronizer supports both Steam and Discord game authentication without creating player profiles for unlinked Discord accounts. Multiple SCP:SL instances share one database configuration and are separated automatically by their game ports.
 
 ## Current features
 
 - Persistent warning, kick and ban history and one-to-one Steam/Discord links stored in PostgreSQL.
+- Linked Discord-authenticated game sessions use the linked Steam profile for statistics, referrals, punishment history and pending warning notifications; unlinked Discord sessions do not create player profiles.
 - Offline warnings are delivered by Discord DM when an account link is available; otherwise they remain pending and are queued as broadcasts when the player next joins the issuing server.
 - Compact aggregate player statistics, keyed by server and Steam ID, including the best Chaos device Snake score; no per-round history rows are retained.
 - Aggregate server statistics, including round outcomes, round duration, warhead detonations and separate MTF/Chaos main and reinforcement waves.

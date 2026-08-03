@@ -47,6 +47,17 @@ namespace SmokyPluginV2.Commands
             string selector = (arguments.Array[arguments.Offset] ?? string.Empty).Trim().Trim('.');
             if (!TryResolvePlayer(selector, out string userId, out Player onlinePlayer, out response))
                 return false;
+            if (onlinePlayer != null &&
+                Plugin.Instance?.PlayerAccess?.TryGetResolvedSteamUserId(onlinePlayer, out userId) != true)
+            {
+                response = "Для Discord-аккаунта игрока не найдена связка со Steam.";
+                return false;
+            }
+            if (!PostgreSqlService.IsSteamUserId(userId))
+            {
+                response = "Статистику пока можно очищать только для Steam-профиля.";
+                return false;
+            }
 
             if (!statistics.TryClearPlayerStatistics(userId, onlinePlayer, out bool existed, out string error))
             {

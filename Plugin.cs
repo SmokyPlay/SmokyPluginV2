@@ -82,7 +82,7 @@ namespace SmokyPluginV2
         public override string Author => "Smoky";
 
         /// <inheritdoc />
-        public override Version Version => new(0, 23, 1);
+        public override Version Version => new(0, 25, 3);
 
         /// <inheritdoc />
         public override Version RequiredExiledVersion => new(9, 14, 2);

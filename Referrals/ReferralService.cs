@@ -132,6 +132,12 @@ namespace SmokyPluginV2.Referrals
                 return false;
             }
 
+            if (Plugin.Instance?.PlayerAccess?.TryGetResolvedSteamUserId(player, out string steamUserId) != true)
+            {
+                response = "Для вашего Discord-аккаунта не найдена связка со Steam.";
+                return false;
+            }
+
             if (!Round.IsStarted || Round.IsEnded)
             {
                 response = "Карту уборщика можно получить только во время активного раунда.";
@@ -140,7 +146,7 @@ namespace SmokyPluginV2.Referrals
 
             lock (janitorCardLock)
             {
-                if (janitorCardUses.Contains(player.UserId))
+                if (janitorCardUses.Contains(steamUserId))
                 {
                     response = "Вы уже получали карту уборщика в этом раунде.";
                     return false;
@@ -149,7 +155,7 @@ namespace SmokyPluginV2.Referrals
 
             long qualificationSeconds = QualificationMinutes * 60L;
             if (!database.TryIsPendingReferral(
-                    player.UserId,
+                    steamUserId,
                     qualificationSeconds,
                     out bool isPendingReferral,
                     out string error))
@@ -189,7 +195,7 @@ namespace SmokyPluginV2.Referrals
             }
 
             lock (janitorCardLock)
-                janitorCardUses.Add(player.UserId);
+                janitorCardUses.Add(steamUserId);
             response = "Карта уборщика добавлена в ваш инвентарь.";
             return true;
         }

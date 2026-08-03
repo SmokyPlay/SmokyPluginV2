@@ -1205,6 +1205,7 @@ namespace SmokyPluginV2.Discord
 
             string json = Json.Serialize(payload);
             int transientFailures = 0;
+            bool unknownMessageRetried = false;
 
             while (!token.IsCancellationRequested)
             {
@@ -1223,6 +1224,7 @@ namespace SmokyPluginV2.Discord
                             }
 
                             string responseText = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                            TryGetDiscordErrorCode(responseText, out int discordErrorCode);
                             if ((int)response.StatusCode == 429)
                             {
                                 double retrySeconds = GetRemainingRestDelaySeconds();
@@ -1247,7 +1249,24 @@ namespace SmokyPluginV2.Discord
                                 return false;
                             }
 
-                            if ((int)response.StatusCode == 403 || (int)response.StatusCode == 404)
+                            if ((int)response.StatusCode == 404 && discordErrorCode == 10008)
+                            {
+                                if (!unknownMessageRetried)
+                                {
+                                    unknownMessageRetried = true;
+                                    transientFailures = 0;
+                                    payload["nonce"] = Guid.NewGuid().ToString("N").Substring(0, 25);
+                                    json = Json.Serialize(payload);
+                                    Log.Warn($"[Discord] Discord returned 10008 Unknown Message while creating a log in channel {channelId}. Retrying once with a new nonce; the channel remains enabled.");
+                                    continue;
+                                }
+
+                                Log.Error($"[Discord] Log delivery to channel {channelId} failed again with 10008 Unknown Message. The channel remains enabled: {responseText}");
+                                return false;
+                            }
+
+                            if ((int)response.StatusCode == 403 ||
+                                ((int)response.StatusCode == 404 && discordErrorCode == 10003))
                             {
                                 if (blockChannelOnClientError)
                                     BlockMessageChannel(channelId, response.StatusCode, responseText);
@@ -1256,8 +1275,7 @@ namespace SmokyPluginV2.Discord
 
                             if ((int)response.StatusCode >= 400 && (int)response.StatusCode < 500)
                             {
-                                if (blockChannelOnClientError)
-                                    BlockMessageChannel(channelId, response.StatusCode, responseText);
+                                Log.Error($"[Discord] Log delivery to channel {channelId} was rejected with {(int)response.StatusCode} (Discord code {discordErrorCode}). The channel remains enabled: {responseText}");
                                 return false;
                             }
 
@@ -1280,6 +1298,29 @@ namespace SmokyPluginV2.Discord
             }
 
             return false;
+        }
+
+        private static bool TryGetDiscordErrorCode(string responseText, out int errorCode)
+        {
+            errorCode = 0;
+            if (string.IsNullOrWhiteSpace(responseText))
+                return false;
+
+            try
+            {
+                Dictionary<string, object> response = Json.DeserializeObject(responseText);
+                return response != null &&
+                    response.TryGetValue("code", out object rawCode) &&
+                    int.TryParse(
+                        Convert.ToString(rawCode, CultureInfo.InvariantCulture),
+                        NumberStyles.Integer,
+                        CultureInfo.InvariantCulture,
+                        out errorCode);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private async Task<ulong> GetOrCreateDirectMessageChannelAsync(ulong discordUserId, CancellationToken token)

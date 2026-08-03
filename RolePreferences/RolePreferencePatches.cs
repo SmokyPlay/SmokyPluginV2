@@ -25,6 +25,7 @@ namespace SmokyPluginV2.RolePreferences
 
         private static void Prefix()
         {
+            Handlers.DiscordGameEventHandler.LogRoundStartingEarly();
             Plugin.Instance?.RolePreferences?.BeginRoleAssignment();
         }
 

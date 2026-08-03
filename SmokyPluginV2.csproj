@@ -193,6 +193,7 @@
     <Compile Include="Patches\RemoteAdminReloadPatch.cs" />
     <Compile Include="Patches\RespawnWaveLoggingPatch.cs" />
     <Compile Include="Patches\SnakeScorePatch.cs" />
+    <Compile Include="Patches\WarheadPanelLoggingPatch.cs" />
     <Compile Include="Plugin.cs" />
     <Compile Include="Privileges\PlayerAccessService.cs" />
     <Compile Include="Privileges\PlayerAccessSnapshot.cs" />
