@@ -7,12 +7,15 @@ namespace SmokyPluginV2.Database
     using System.Linq;
     using System.Security.Cryptography;
     using System.Text;
+    using System.Threading;
+    using System.Threading.Tasks;
 
     using Exiled.API.Features;
 
     using Npgsql;
 
     using SmokyPluginV2.AccountLinks;
+    using SmokyPluginV2.Privileges;
     using SmokyPluginV2.Referrals;
     using SmokyPluginV2.Statistics;
     using SmokyPluginV2.Moderation;
@@ -42,7 +45,9 @@ namespace SmokyPluginV2.Database
 
         private readonly string connectionString;
         private readonly SharedDatabaseSettings settings;
+        private readonly CancellationTokenSource statisticsNotificationCancellation = new CancellationTokenSource();
         private string serverName;
+        private Task statisticsNotificationListener;
 
         public PostgreSqlService(SharedDatabaseSettings settings, string serverName)
         {
@@ -68,6 +73,8 @@ namespace SmokyPluginV2.Database
             ServerId = ResolveServer();
             EnsureServerStatisticsRow();
             IsAvailable = true;
+            statisticsNotificationListener = Task.Run(
+                () => ListenForPlayerStatisticsChangesAsync(statisticsNotificationCancellation.Token));
             Log.Info($"[Database] PostgreSQL connected. Game port {Server.Port} has server id {ServerId}.");
         }
 
@@ -76,6 +83,8 @@ namespace SmokyPluginV2.Database
         public long ServerId { get; private set; }
 
         public string ServerName => string.IsNullOrWhiteSpace(serverName) ? "Server " + Server.Port : serverName.Trim();
+
+        internal event Action PlayerStatisticsChanged;
 
         public bool TryUpdateServerName(string reloadedServerName, out string error)
         {
@@ -118,6 +127,80 @@ namespace SmokyPluginV2.Database
         public void Dispose()
         {
             IsAvailable = false;
+            statisticsNotificationCancellation.Cancel();
+            try
+            {
+                statisticsNotificationListener?.Wait(TimeSpan.FromSeconds(1));
+            }
+            catch (AggregateException exception) when (exception.InnerExceptions.All(inner => inner is OperationCanceledException))
+            {
+                // Expected while the dedicated LISTEN connection is being stopped.
+            }
+        }
+
+        private void NotifyPlayerStatisticsChanged()
+        {
+            try
+            {
+                PlayerStatisticsChanged?.Invoke();
+            }
+            catch (Exception exception)
+            {
+                Log.Error($"[Database] Player statistics were saved, but the change notification failed:\n{exception}");
+            }
+        }
+
+        private async Task ListenForPlayerStatisticsChangesAsync(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    using (NpgsqlConnection connection = new NpgsqlConnection(connectionString))
+                    {
+                        connection.Notification += OnPlayerStatisticsNotification;
+                        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+                        using (NpgsqlCommand command = new NpgsqlCommand(
+                            "LISTEN smoky_player_statistics_changed",
+                            connection))
+                        {
+                            command.CommandTimeout = CommandTimeoutSeconds;
+                            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                        }
+
+                        while (!cancellationToken.IsCancellationRequested)
+                            await connection.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    }
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception exception)
+                {
+                    Log.Error($"[Database] PostgreSQL statistics notification listener failed; reconnecting in 5 seconds:\n{exception}");
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        private void OnPlayerStatisticsNotification(object sender, NpgsqlNotificationEventArgs eventArgs)
+        {
+            if (!string.Equals(eventArgs.Channel, "smoky_player_statistics_changed", StringComparison.Ordinal) ||
+                (!string.Equals(eventArgs.Payload, "*", StringComparison.Ordinal) &&
+                 !string.Equals(eventArgs.Payload, ServerId.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal)))
+            {
+                return;
+            }
+
+            NotifyPlayerStatisticsChanged();
         }
 
         public bool TryGetDiscordUserId(string playerUserId, out ulong discordUserId, out string error)
@@ -241,6 +324,175 @@ namespace SmokyPluginV2.Database
             catch (Exception exception)
             {
                 return Fail("player playtime lookup", exception, out error);
+            }
+        }
+
+        public bool TryGetPrivilegeGrants(
+            string subjectType,
+            string subjectId,
+            out IReadOnlyCollection<string> activeGroups,
+            out IReadOnlyCollection<string> managedGroups,
+            out IReadOnlyCollection<PendingPrivilegeRevocation> pendingRevocations,
+            out string error)
+        {
+            HashSet<string> active = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> managed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            List<PendingPrivilegeRevocation> revocations = new List<PendingPrivilegeRevocation>();
+            try
+            {
+                string normalizedType = NormalizePrivilegeSubjectType(subjectType);
+                string normalizedId = NormalizePrivilegeSubjectId(normalizedType, subjectId);
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
+                    "SELECT id,group_name,source_type," +
+                    "(expires_at IS NULL OR expires_at>CURRENT_TIMESTAMP) AS is_active " +
+                    "FROM privilege_grants " +
+                    "WHERE subject_type=@subject_type AND subject_id=@subject_id AND revoked_at IS NULL"))
+                {
+                    command.Parameters.AddWithValue("@subject_type", normalizedType);
+                    command.Parameters.AddWithValue("@subject_id", normalizedId);
+                    using (NpgsqlDataReader reader = command.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            string groupName = GetString(reader, "group_name");
+                            managed.Add(groupName);
+                            bool isActive = Convert.ToBoolean(
+                                reader["is_active"],
+                                CultureInfo.InvariantCulture);
+                            if (isActive)
+                            {
+                                active.Add(groupName);
+                                continue;
+                            }
+
+                            revocations.Add(new PendingPrivilegeRevocation
+                            {
+                                SourceId = GetInt64(reader, "id"),
+                                SourceType = GetString(reader, "source_type"),
+                                GroupName = groupName,
+                            });
+                        }
+                    }
+                }
+
+                activeGroups = active.ToArray();
+                managedGroups = managed.ToArray();
+                pendingRevocations = revocations;
+                error = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                activeGroups = Array.Empty<string>();
+                managedGroups = Array.Empty<string>();
+                pendingRevocations = Array.Empty<PendingPrivilegeRevocation>();
+                return Fail("privilege grant lookup", exception, out error);
+            }
+        }
+
+        public bool TryGrantPermanentSteamPrivilege(
+            string playerUserId,
+            string groupName,
+            string sourceType,
+            out bool inserted,
+            out string error)
+        {
+            inserted = false;
+            try
+            {
+                string normalizedGroup = NormalizePrivilegeGroupName(groupName);
+                string normalizedSource = NormalizePrivilegeSourceType(sourceType);
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
+                    "INSERT INTO privilege_grants(subject_type,subject_id,group_name,source_type,source_key,granted_at,expires_at) " +
+                    "VALUES('steam',@subject_id,@group_name,@source_type,@source_key,CURRENT_TIMESTAMP,NULL) " +
+                    "ON CONFLICT DO NOTHING RETURNING id"))
+                {
+                    command.Parameters.AddWithValue("@subject_id", NormalizeSteamId(playerUserId));
+                    command.Parameters.AddWithValue("@group_name", normalizedGroup);
+                    command.Parameters.AddWithValue("@source_type", normalizedSource);
+                    command.Parameters.AddWithValue("@source_key", normalizedSource);
+                    object value = command.ExecuteScalar();
+                    inserted = value != null && value != DBNull.Value;
+                }
+
+                error = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                return Fail("permanent Steam privilege grant", exception, out error);
+            }
+        }
+
+        public bool TryGrantEarnedPlaytimePrivilege(
+            string playerUserId,
+            long requiredSeconds,
+            string groupName,
+            out bool inserted,
+            out string error)
+        {
+            inserted = false;
+            try
+            {
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
+                    "INSERT INTO privilege_grants(subject_type,subject_id,group_name,source_type,source_key,granted_at,expires_at) " +
+                    "SELECT 'steam',p.steam_id,@group_name,'earned_playtime','earned_playtime',CURRENT_TIMESTAMP,NULL " +
+                    "FROM players p WHERE p.steam_id=@steam_id AND " +
+                    "(SELECT COALESCE(SUM(COALESCE(ps.human_seconds,0)+COALESCE(ps.scp_seconds,0)+COALESCE(ps.spectator_seconds,0)),0) " +
+                    "FROM player_statistics ps WHERE ps.server_id=@server_id AND ps.player_id=p.id)>=@required_seconds " +
+                    "ON CONFLICT DO NOTHING RETURNING id"))
+                {
+                    command.Parameters.AddWithValue("@group_name", NormalizePrivilegeGroupName(groupName));
+                    command.Parameters.AddWithValue("@steam_id", NormalizeSteamId(playerUserId));
+                    command.Parameters.AddWithValue("@server_id", ServerId);
+                    command.Parameters.AddWithValue("@required_seconds", Math.Max(1, requiredSeconds));
+                    object value = command.ExecuteScalar();
+                    inserted = value != null && value != DBNull.Value;
+                }
+
+                error = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                return Fail("earned playtime privilege grant", exception, out error);
+            }
+        }
+
+        public bool TryFinalizePrivilegeRevocations(
+            IEnumerable<long> sourceIds,
+            out string error)
+        {
+            long[] ids = (sourceIds ?? Enumerable.Empty<long>())
+                .Where(id => id > 0)
+                .Distinct()
+                .ToArray();
+            if (ids.Length == 0)
+            {
+                error = null;
+                return true;
+            }
+
+            try
+            {
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
+                    "UPDATE privilege_grants SET revoked_at=CURRENT_TIMESTAMP " +
+                    "WHERE id=ANY(@ids) AND revoked_at IS NULL"))
+                {
+                    command.Parameters.AddWithValue("@ids", ids);
+                    command.ExecuteNonQuery();
+                }
+
+                error = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                return Fail("privilege revocation finalization", exception, out error);
             }
         }
 
@@ -426,6 +678,7 @@ namespace SmokyPluginV2.Database
 
         public bool TryGetOrCreateReferralStatus(
             ulong discordUserId,
+            string privilegeGroupName,
             out ReferralStatus status,
             out string error)
         {
@@ -437,9 +690,8 @@ namespace SmokyPluginV2.Database
                 {
                     long playerId;
                     string playerUserId;
-                    string referralCode;
                     using (NpgsqlCommand player = CreateCommand(connection,
-                        "SELECT p.id,p.steam_id,p.referral_code FROM account_links al " +
+                        "SELECT p.id,p.steam_id FROM account_links al " +
                         "JOIN players p ON p.id=al.player_id WHERE al.discord_user_id=@discord_id LIMIT 1 FOR UPDATE",
                         transaction))
                     {
@@ -456,55 +708,16 @@ namespace SmokyPluginV2.Database
 
                             playerId = GetInt64(reader, "id");
                             playerUserId = ToExiledUserId(GetString(reader, "steam_id"));
-                            referralCode = reader.IsDBNull(reader.GetOrdinal("referral_code"))
-                                ? null
-                                : GetString(reader, "referral_code");
                         }
                     }
 
-                    if (string.IsNullOrWhiteSpace(referralCode))
-                        referralCode = CreateReferralCode(connection, transaction, playerId);
-
-                    List<ReferralParticipant> participants = new List<ReferralParticipant>();
-                    using (NpgsqlCommand referrals = CreateCommand(connection,
-                        "SELECT p.steam_id,p.last_nickname,r.accepted_at," +
-                        "COALESCE(SUM(COALESCE(ps.human_seconds,0)+COALESCE(ps.scp_seconds,0)+COALESCE(ps.spectator_seconds,0)),0) AS total_seconds " +
-                        "FROM referrals r JOIN players p ON p.id=r.invited_player_id " +
-                        "LEFT JOIN player_statistics ps ON ps.player_id=p.id " +
-                        "WHERE r.inviter_player_id=@player_id " +
-                        "GROUP BY p.id,p.steam_id,p.last_nickname,r.accepted_at " +
-                        "ORDER BY r.accepted_at ASC",
-                        transaction))
-                    {
-                        referrals.Parameters.AddWithValue("@player_id", playerId);
-                        using (NpgsqlDataReader reader = referrals.ExecuteReader())
-                        {
-                            while (reader.Read())
-                            {
-                                participants.Add(new ReferralParticipant
-                                {
-                                    PlayerUserId = ToExiledUserId(GetString(reader, "steam_id")),
-                                    Nickname = reader.IsDBNull(reader.GetOrdinal("last_nickname"))
-                                        ? null
-                                        : GetString(reader, "last_nickname"),
-                                    AcceptedAtUtc = DateTime.SpecifyKind(
-                                        GetDateTime(reader, "accepted_at"),
-                                        DateTimeKind.Utc),
-                                    TotalPlaytimeSeconds = Convert.ToInt64(
-                                        reader["total_seconds"],
-                                        CultureInfo.InvariantCulture),
-                                });
-                            }
-                        }
-                    }
-
+                    status = BuildReferralStatus(
+                        connection,
+                        transaction,
+                        playerId,
+                        playerUserId,
+                        privilegeGroupName);
                     transaction.Commit();
-                    status = new ReferralStatus
-                    {
-                        PlayerUserId = playerUserId,
-                        ReferralCode = referralCode,
-                        Participants = participants,
-                    };
                 }
 
                 error = null;
@@ -515,6 +728,109 @@ namespace SmokyPluginV2.Database
                 status = null;
                 return Fail("referral status lookup", exception, out error);
             }
+        }
+
+        public bool TryGetOrCreateReferralStatus(
+            string playerUserId,
+            string privilegeGroupName,
+            out ReferralStatus status,
+            out string error)
+        {
+            status = null;
+            try
+            {
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
+                {
+                    long playerId = GetOrCreatePlayerId(connection, transaction, playerUserId, null);
+                    string resolvedPlayerUserId = ToExiledUserId(NormalizeSteamId(playerUserId));
+                    status = BuildReferralStatus(
+                        connection,
+                        transaction,
+                        playerId,
+                        resolvedPlayerUserId,
+                        privilegeGroupName);
+                    transaction.Commit();
+                }
+
+                error = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                status = null;
+                return Fail("in-game referral status lookup", exception, out error);
+            }
+        }
+
+        private ReferralStatus BuildReferralStatus(
+            NpgsqlConnection connection,
+            NpgsqlTransaction transaction,
+            long playerId,
+            string playerUserId,
+            string privilegeGroupName)
+        {
+            string referralCode;
+            using (NpgsqlCommand player = CreateCommand(connection,
+                "SELECT referral_code FROM players WHERE id=@player_id FOR UPDATE",
+                transaction))
+            {
+                player.Parameters.AddWithValue("@player_id", playerId);
+                object value = player.ExecuteScalar();
+                referralCode = value == null || value == DBNull.Value
+                    ? null
+                    : Convert.ToString(value, CultureInfo.InvariantCulture);
+            }
+
+            if (string.IsNullOrWhiteSpace(referralCode))
+                referralCode = CreateReferralCode(connection, transaction, playerId);
+
+            List<ReferralParticipant> participants = new List<ReferralParticipant>();
+            using (NpgsqlCommand referrals = CreateCommand(connection,
+                "SELECT p.steam_id,p.last_nickname,r.accepted_at," +
+                "COALESCE(SUM(COALESCE(ps.human_seconds,0)+COALESCE(ps.scp_seconds,0)+COALESCE(ps.spectator_seconds,0)),0) AS total_seconds " +
+                "FROM referrals r JOIN players p ON p.id=r.invited_player_id " +
+                "LEFT JOIN player_statistics ps ON ps.player_id=p.id " +
+                "WHERE r.inviter_player_id=@player_id " +
+                "GROUP BY p.id,p.steam_id,p.last_nickname,r.accepted_at " +
+                "ORDER BY r.accepted_at ASC",
+                transaction))
+            {
+                referrals.Parameters.AddWithValue("@player_id", playerId);
+                using (NpgsqlDataReader reader = referrals.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        participants.Add(new ReferralParticipant
+                        {
+                            PlayerUserId = ToExiledUserId(GetString(reader, "steam_id")),
+                            Nickname = reader.IsDBNull(reader.GetOrdinal("last_nickname"))
+                                ? null
+                                : GetString(reader, "last_nickname"),
+                            AcceptedAtUtc = DateTime.SpecifyKind(
+                                GetDateTime(reader, "accepted_at"),
+                                DateTimeKind.Utc),
+                            TotalPlaytimeSeconds = Convert.ToInt64(
+                                reader["total_seconds"],
+                                CultureInfo.InvariantCulture),
+                        });
+                    }
+                }
+            }
+
+            return new ReferralStatus
+            {
+                PlayerUserId = playerUserId,
+                ReferralCode = referralCode,
+                HasReferralPrivilege = HasActivePrivilege(
+                    connection,
+                    transaction,
+                    "steam",
+                    NormalizeSteamId(playerUserId),
+                    privilegeGroupName,
+                    "earned_referrals"),
+                Participants = participants,
+            };
         }
 
         public bool TryGetReferralQualificationTransition(
@@ -563,7 +879,7 @@ namespace SmokyPluginV2.Database
                     long threshold = Math.Max(1, qualificationSeconds);
                     bool crossed = totalSeconds >= threshold &&
                         Math.Max(0, totalSeconds - Math.Max(0, addedPlaytimeSeconds)) < threshold;
-                    if (!crossed)
+                    if (totalSeconds < threshold)
                     {
                         error = null;
                         return true;
@@ -585,8 +901,9 @@ namespace SmokyPluginV2.Database
                     transition = new ReferralQualificationTransition
                     {
                         InviteeQualified = true,
+                        InviteeJustQualified = crossed,
                         InviterPlayerUserId = inviterSteamId,
-                        RewardThresholdReached = qualifiedCount == Math.Max(1, requiredReferrals),
+                        RewardThresholdReached = qualifiedCount >= Math.Max(1, requiredReferrals),
                     };
                 }
 
@@ -653,6 +970,35 @@ namespace SmokyPluginV2.Database
             catch (Exception exception)
             {
                 return Fail("statistics privacy update", exception, out error);
+            }
+        }
+
+        public bool TryToggleStatisticsPrivacy(string playerUserId, out bool isPrivate, out bool playerExists, out string error)
+        {
+            isPrivate = false;
+            playerExists = false;
+            try
+            {
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection,
+                    "UPDATE players SET statistics_private=NOT statistics_private,updated_at=CURRENT_TIMESTAMP " +
+                    "WHERE steam_id=@steam_id RETURNING statistics_private"))
+                {
+                    command.Parameters.AddWithValue("@steam_id", NormalizeSteamId(playerUserId));
+                    object result = command.ExecuteScalar();
+                    if (result != null && result != DBNull.Value)
+                    {
+                        playerExists = true;
+                        isPrivate = Convert.ToBoolean(result, CultureInfo.InvariantCulture);
+                    }
+                }
+
+                error = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                return Fail("statistics privacy toggle", exception, out error);
             }
         }
 
@@ -1011,6 +1357,7 @@ namespace SmokyPluginV2.Database
 
                 transaction.Commit();
             }
+
         }
 
         public void UpdateServerStatistics(ServerStatDelta delta)
@@ -1121,6 +1468,114 @@ namespace SmokyPluginV2.Database
             catch (Exception exception)
             {
                 return Fail("server statistics lookup", exception, out error);
+            }
+        }
+
+        public bool TryGetLeaderboards(out LeaderboardRecord record, out string error)
+        {
+            record = null;
+            try
+            {
+                Dictionary<LeaderboardCategory, List<LeaderboardEntry>> pages =
+                    Enum.GetValues(typeof(LeaderboardCategory))
+                        .Cast<LeaderboardCategory>()
+                        .ToDictionary(category => category, _ => new List<LeaderboardEntry>());
+
+                const string query = @"
+(SELECT 'playtime'::text AS category,
+        COALESCE(NULLIF(BTRIM(p.last_nickname), ''), 'Игрок') AS nickname,
+        (ps.human_seconds + ps.scp_seconds + ps.spectator_seconds)::bigint AS value,
+        'none'::text AS escape_role
+ FROM player_statistics ps
+ JOIN players p ON p.id=ps.player_id
+ WHERE ps.server_id=@server_id AND p.statistics_private=FALSE
+   AND (ps.human_seconds + ps.scp_seconds + ps.spectator_seconds)>0
+ ORDER BY value DESC, LOWER(COALESCE(p.last_nickname, '')), p.steam_id
+ LIMIT 10)
+UNION ALL
+(SELECT 'kills'::text AS category,
+        COALESCE(NULLIF(BTRIM(p.last_nickname), ''), 'Игрок') AS nickname,
+        (ps.human_kills_as_human + ps.human_kills_as_scp + ps.scps_destroyed)::bigint AS value,
+        'none'::text AS escape_role
+ FROM player_statistics ps
+ JOIN players p ON p.id=ps.player_id
+ WHERE ps.server_id=@server_id AND p.statistics_private=FALSE
+   AND (ps.human_kills_as_human + ps.human_kills_as_scp + ps.scps_destroyed)>0
+ ORDER BY value DESC, LOWER(COALESCE(p.last_nickname, '')), p.steam_id
+ LIMIT 10)
+UNION ALL
+(SELECT 'escapes'::text AS category,
+        COALESCE(NULLIF(BTRIM(p.last_nickname), ''), 'Игрок') AS nickname,
+        (ps.classd_escapes_uncuffed + ps.scientist_escapes_uncuffed)::bigint AS value,
+        'none'::text AS escape_role
+ FROM player_statistics ps
+ JOIN players p ON p.id=ps.player_id
+ WHERE ps.server_id=@server_id AND p.statistics_private=FALSE
+   AND (ps.classd_escapes_uncuffed + ps.scientist_escapes_uncuffed)>0
+ ORDER BY value DESC, LOWER(COALESCE(p.last_nickname, '')), p.steam_id
+ LIMIT 10)
+UNION ALL
+(SELECT 'fastest_escape'::text AS category,
+        COALESCE(NULLIF(BTRIM(p.last_nickname), ''), 'Игрок') AS nickname,
+        LEAST(
+            COALESCE(NULLIF(ps.fastest_classd_escape_uncuffed_seconds, 0), 9223372036854775807),
+            COALESCE(NULLIF(ps.fastest_scientist_escape_uncuffed_seconds, 0), 9223372036854775807))::bigint AS value,
+        CASE
+            WHEN NULLIF(ps.fastest_classd_escape_uncuffed_seconds, 0) IS NOT NULL
+             AND ps.fastest_classd_escape_uncuffed_seconds=ps.fastest_scientist_escape_uncuffed_seconds THEN 'both'
+            WHEN NULLIF(ps.fastest_classd_escape_uncuffed_seconds, 0) IS NOT NULL
+             AND (NULLIF(ps.fastest_scientist_escape_uncuffed_seconds, 0) IS NULL
+                  OR ps.fastest_classd_escape_uncuffed_seconds<ps.fastest_scientist_escape_uncuffed_seconds) THEN 'classd'
+            ELSE 'scientist'
+        END::text AS escape_role
+ FROM player_statistics ps
+ JOIN players p ON p.id=ps.player_id
+ WHERE ps.server_id=@server_id AND p.statistics_private=FALSE
+   AND (COALESCE(ps.fastest_classd_escape_uncuffed_seconds, 0)>0
+        OR COALESCE(ps.fastest_scientist_escape_uncuffed_seconds, 0)>0)
+ ORDER BY value ASC, LOWER(COALESCE(p.last_nickname, '')), p.steam_id
+ LIMIT 10)
+UNION ALL
+(SELECT 'snake'::text AS category,
+        COALESCE(NULLIF(BTRIM(p.last_nickname), ''), 'Игрок') AS nickname,
+        ps.best_snake_score::bigint AS value,
+        'none'::text AS escape_role
+ FROM player_statistics ps
+ JOIN players p ON p.id=ps.player_id
+ WHERE ps.server_id=@server_id AND p.statistics_private=FALSE
+   AND ps.best_snake_score>0
+ ORDER BY value DESC, LOWER(COALESCE(p.last_nickname, '')), p.steam_id
+ LIMIT 10)";
+
+                using (NpgsqlConnection connection = OpenConnection())
+                using (NpgsqlCommand command = CreateCommand(connection, query))
+                {
+                    command.Parameters.AddWithValue("@server_id", ServerId);
+                    using (NpgsqlDataReader reader = command.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            LeaderboardCategory category = ParseLeaderboardCategory(GetString(reader, "category"));
+                            pages[category].Add(new LeaderboardEntry
+                            {
+                                Nickname = GetString(reader, "nickname"),
+                                Value = GetInt64(reader, "value"),
+                                EscapeRole = ParseLeaderboardEscapeRole(GetString(reader, "escape_role")),
+                            });
+                        }
+                    }
+                }
+
+                record = new LeaderboardRecord();
+                foreach (KeyValuePair<LeaderboardCategory, List<LeaderboardEntry>> page in pages)
+                    record.SetEntries(page.Key, page.Value);
+
+                error = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                return Fail("leaderboard lookup", exception, out error);
             }
         }
 
@@ -1315,6 +1770,35 @@ namespace SmokyPluginV2.Database
             ApplySchemaMigration(connection, 8, "Warning delivery tracking", ApplyWarningDeliveryTrackingMigration);
             ApplySchemaMigration(connection, 9, "Snake high score", ApplySnakeHighScoreMigration);
             ApplySchemaMigration(connection, 10, "Remove offline ban nickname placeholders", ApplyOfflineBanNicknameCleanupMigration);
+            ApplySchemaMigration(connection, 11, "Persistent Steam and Discord privilege grants", ApplyPrivilegeGrantsMigration);
+            ApplySchemaMigration(connection, 12, "Player statistics change notifications", ApplyPlayerStatisticsNotificationsMigration);
+        }
+
+        private static void ApplyPlayerStatisticsNotificationsMigration(
+            NpgsqlConnection connection,
+            NpgsqlTransaction transaction)
+        {
+            string[] statements =
+            {
+                "CREATE OR REPLACE FUNCTION smoky_notify_player_statistics_changed() RETURNS trigger LANGUAGE plpgsql AS $$ " +
+                "BEGIN PERFORM pg_notify('smoky_player_statistics_changed',COALESCE(NEW.server_id,OLD.server_id)::text); " +
+                "RETURN COALESCE(NEW,OLD); END $$",
+                "DROP TRIGGER IF EXISTS smoky_player_statistics_changed ON player_statistics",
+                "CREATE TRIGGER smoky_player_statistics_changed AFTER INSERT OR UPDATE OR DELETE ON player_statistics " +
+                "FOR EACH ROW EXECUTE PROCEDURE smoky_notify_player_statistics_changed()",
+                "CREATE OR REPLACE FUNCTION smoky_notify_statistics_privacy_changed() RETURNS trigger LANGUAGE plpgsql AS $$ " +
+                "BEGIN IF OLD.statistics_private IS DISTINCT FROM NEW.statistics_private THEN " +
+                "PERFORM pg_notify('smoky_player_statistics_changed','*'); END IF; RETURN NEW; END $$",
+                "DROP TRIGGER IF EXISTS smoky_statistics_privacy_changed ON players",
+                "CREATE TRIGGER smoky_statistics_privacy_changed AFTER UPDATE OF statistics_private ON players " +
+                "FOR EACH ROW EXECUTE PROCEDURE smoky_notify_statistics_privacy_changed()",
+            };
+
+            foreach (string statement in statements)
+            {
+                using (NpgsqlCommand command = CreateCommand(connection, statement, transaction))
+                    command.ExecuteNonQuery();
+            }
         }
 
         private static void ApplySchemaMigration(
@@ -1408,6 +1892,21 @@ namespace SmokyPluginV2.Database
                 "UPDATE players SET last_nickname=NULL,updated_at=CURRENT_TIMESTAMP " +
                 "WHERE LOWER(BTRIM(last_nickname))='unknown - offline ban'", transaction))
                 cleanup.ExecuteNonQuery();
+        }
+
+        private static void ApplyPrivilegeGrantsMigration(
+            NpgsqlConnection connection,
+            NpgsqlTransaction transaction)
+        {
+            using (NpgsqlCommand table = CreateCommand(connection,
+                PrivilegeGrantsTableStatement, transaction))
+                table.ExecuteNonQuery();
+            using (NpgsqlCommand uniqueIndex = CreateCommand(connection,
+                PrivilegeGrantsUniqueIndexStatement, transaction))
+                uniqueIndex.ExecuteNonQuery();
+            using (NpgsqlCommand activeIndex = CreateCommand(connection,
+                PrivilegeGrantsActiveIndexStatement, transaction))
+                activeIndex.ExecuteNonQuery();
         }
 
         private long ResolveServer()
@@ -1662,6 +2161,30 @@ namespace SmokyPluginV2.Database
             MtfReinforcementWaves = GetInt64(reader, "mtf_reinforcement_waves"), ChaosReinforcementWaves = GetInt64(reader, "chaos_reinforcement_waves"),
         };
 
+        private static LeaderboardCategory ParseLeaderboardCategory(string category)
+        {
+            switch (category)
+            {
+                case "playtime": return LeaderboardCategory.Playtime;
+                case "kills": return LeaderboardCategory.Kills;
+                case "escapes": return LeaderboardCategory.Escapes;
+                case "fastest_escape": return LeaderboardCategory.FastestEscape;
+                case "snake": return LeaderboardCategory.Snake;
+                default: throw new InvalidOperationException("Unknown leaderboard category: " + category);
+            }
+        }
+
+        private static LeaderboardEscapeRole ParseLeaderboardEscapeRole(string role)
+        {
+            switch (role)
+            {
+                case "classd": return LeaderboardEscapeRole.ClassD;
+                case "scientist": return LeaderboardEscapeRole.Scientist;
+                case "both": return LeaderboardEscapeRole.Both;
+                default: return LeaderboardEscapeRole.None;
+            }
+        }
+
         private static long GetInt64(NpgsqlDataReader reader, string name) => Convert.ToInt64(reader[name], CultureInfo.InvariantCulture);
         private static string GetString(NpgsqlDataReader reader, string name) => Convert.ToString(reader[name], CultureInfo.InvariantCulture);
         private static DateTime GetDateTime(NpgsqlDataReader reader, string name) => Convert.ToDateTime(reader[name], CultureInfo.InvariantCulture);
@@ -1686,6 +2209,83 @@ namespace SmokyPluginV2.Database
             }
         }
 
+        private static bool HasActivePrivilege(
+            NpgsqlConnection connection,
+            NpgsqlTransaction transaction,
+            string subjectType,
+            string subjectId,
+            string groupName,
+            string sourceType)
+        {
+            if (string.IsNullOrWhiteSpace(groupName) || string.IsNullOrWhiteSpace(sourceType))
+                return false;
+
+            using (NpgsqlCommand command = CreateCommand(connection,
+                "SELECT EXISTS(SELECT 1 FROM privilege_grants " +
+                "WHERE subject_type=@subject_type AND subject_id=@subject_id " +
+                "AND LOWER(group_name)=LOWER(@group_name) AND source_type=@source_type " +
+                "AND revoked_at IS NULL " +
+                "AND (expires_at IS NULL OR expires_at>CURRENT_TIMESTAMP))",
+                transaction))
+            {
+                command.Parameters.AddWithValue(
+                    "@subject_type",
+                    NormalizePrivilegeSubjectType(subjectType));
+                command.Parameters.AddWithValue(
+                    "@subject_id",
+                    NormalizePrivilegeSubjectId(subjectType, subjectId));
+                command.Parameters.AddWithValue("@group_name", groupName.Trim());
+                command.Parameters.AddWithValue(
+                    "@source_type",
+                    NormalizePrivilegeSourceType(sourceType));
+                return Convert.ToBoolean(command.ExecuteScalar(), CultureInfo.InvariantCulture);
+            }
+        }
+
+        private static string NormalizePrivilegeSubjectType(string subjectType)
+        {
+            string value = (subjectType ?? string.Empty).Trim().ToLowerInvariant();
+            if (value != "steam" && value != "discord")
+                throw new ArgumentException("Privilege subject type must be steam or discord.", nameof(subjectType));
+            return value;
+        }
+
+        private static string NormalizePrivilegeSubjectId(string subjectType, string subjectId)
+        {
+            string normalizedType = NormalizePrivilegeSubjectType(subjectType);
+            if (normalizedType == "steam")
+                return NormalizeSteamId(subjectId);
+
+            string value = (subjectId ?? string.Empty).Trim();
+            if (value.EndsWith("@discord", StringComparison.OrdinalIgnoreCase))
+                value = value.Substring(0, value.Length - "@discord".Length);
+            if (value.Length < 17 || value.Length > 20 ||
+                !value.All(character => character >= '0' && character <= '9') ||
+                !ulong.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out ulong discordId) ||
+                discordId == 0)
+            {
+                throw new ArgumentException("A valid Discord user ID is required.", nameof(subjectId));
+            }
+
+            return value;
+        }
+
+        private static string NormalizePrivilegeGroupName(string groupName)
+        {
+            string value = (groupName ?? string.Empty).Trim();
+            if (value.Length == 0 || value.Length > 64)
+                throw new ArgumentException("Privilege group name must contain between 1 and 64 characters.", nameof(groupName));
+            return value;
+        }
+
+        private static string NormalizePrivilegeSourceType(string sourceType)
+        {
+            string value = (sourceType ?? string.Empty).Trim().ToLowerInvariant();
+            if (value.Length == 0 || value.Length > 32)
+                throw new ArgumentException("Privilege source type must contain between 1 and 32 characters.", nameof(sourceType));
+            return value;
+        }
+
         private static bool Fail(string operation, Exception exception, out string error)
         {
             error = "Ошибка PostgreSQL. Подробности записаны в консоль сервера.";
@@ -1700,14 +2300,37 @@ namespace SmokyPluginV2.Database
             "CREATE TABLE IF NOT EXISTS players(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,steam_id VARCHAR(32) NOT NULL UNIQUE,last_nickname VARCHAR(64) NULL,statistics_private BOOLEAN NOT NULL DEFAULT FALSE,referral_code VARCHAR(16) NULL,created_at TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP(6),updated_at TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP(6))",
             "CREATE TABLE IF NOT EXISTS account_links(player_id BIGINT NOT NULL PRIMARY KEY,discord_user_id VARCHAR(20) NOT NULL UNIQUE,linked_at TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL,CONSTRAINT fk_account_links_player FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS referrals(invited_player_id BIGINT NOT NULL,inviter_player_id BIGINT NOT NULL,accepted_at TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL,PRIMARY KEY(invited_player_id),CONSTRAINT fk_referrals_invited FOREIGN KEY(invited_player_id) REFERENCES players(id) ON DELETE CASCADE,CONSTRAINT fk_referrals_inviter FOREIGN KEY(inviter_player_id) REFERENCES players(id) ON DELETE CASCADE)",
+            PrivilegeGrantsTableStatement,
             "CREATE TABLE IF NOT EXISTS punishments(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,server_id BIGINT NOT NULL,player_id BIGINT NOT NULL,moderator_user_id VARCHAR(64) NOT NULL,type VARCHAR(16) NOT NULL CHECK(type IN ('warning','kick','ban')),reason TEXT NOT NULL,issued_at TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL,expires_at TIMESTAMP(6) WITHOUT TIME ZONE NULL,notified_at TIMESTAMP(6) WITHOUT TIME ZONE NULL,CONSTRAINT fk_punishments_server FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,CONSTRAINT fk_punishments_player FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE RESTRICT)",
             "CREATE TABLE IF NOT EXISTS player_statistics(server_id BIGINT NOT NULL,player_id BIGINT NOT NULL,last_seen TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL,rounds_completed BIGINT NOT NULL DEFAULT 0,human_seconds BIGINT NOT NULL DEFAULT 0,scp_seconds BIGINT NOT NULL DEFAULT 0,spectator_seconds BIGINT NOT NULL DEFAULT 0,best_human_kills_round BIGINT NOT NULL DEFAULT 0,best_scp_kills_round BIGINT NOT NULL DEFAULT 0,longest_human_life_seconds BIGINT NOT NULL DEFAULT 0,longest_scp_life_seconds BIGINT NOT NULL DEFAULT 0,human_kills_as_human BIGINT NOT NULL DEFAULT 0,human_kills_as_scp BIGINT NOT NULL DEFAULT 0,scps_destroyed BIGINT NOT NULL DEFAULT 0,human_deaths BIGINT NOT NULL DEFAULT 0,scp_deaths BIGINT NOT NULL DEFAULT 0,classd_escapes_uncuffed BIGINT NOT NULL DEFAULT 0,fastest_classd_escape_uncuffed_seconds BIGINT NULL,classd_escapes_cuffed BIGINT NOT NULL DEFAULT 0,fastest_classd_escape_cuffed_seconds BIGINT NULL,scientist_escapes_uncuffed BIGINT NOT NULL DEFAULT 0,fastest_scientist_escape_uncuffed_seconds BIGINT NULL,scientist_escapes_cuffed BIGINT NOT NULL DEFAULT 0,fastest_scientist_escape_cuffed_seconds BIGINT NULL,classd_escorted BIGINT NOT NULL DEFAULT 0,scientist_escorted BIGINT NOT NULL DEFAULT 0,warhead_countdowns_started BIGINT NOT NULL DEFAULT 0,warhead_detonations BIGINT NOT NULL DEFAULT 0,warhead_countdowns_stopped BIGINT NOT NULL DEFAULT 0,pocket_entries BIGINT NOT NULL DEFAULT 0,pocket_escapes BIGINT NOT NULL DEFAULT 0,longest_pocket_seconds BIGINT NOT NULL DEFAULT 0,zombies_created BIGINT NOT NULL DEFAULT 0,generators_activated BIGINT NOT NULL DEFAULT 0,system_reboots_started BIGINT NOT NULL DEFAULT 0,tesla_kills_as_079 BIGINT NOT NULL DEFAULT 0,pink_candies_eaten BIGINT NOT NULL DEFAULT 0,best_snake_score BIGINT NOT NULL DEFAULT 0,PRIMARY KEY(server_id,player_id),CONSTRAINT fk_player_statistics_server FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,CONSTRAINT fk_player_statistics_player FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS server_statistics(server_id BIGINT NOT NULL PRIMARY KEY,rounds_completed BIGINT NOT NULL DEFAULT 0,total_round_seconds BIGINT NOT NULL DEFAULT 0,longest_round_seconds BIGINT NOT NULL DEFAULT 0,scp_wins BIGINT NOT NULL DEFAULT 0,foundation_wins BIGINT NOT NULL DEFAULT 0,chaos_wins BIGINT NOT NULL DEFAULT 0,draws BIGINT NOT NULL DEFAULT 0,warhead_detonations BIGINT NOT NULL DEFAULT 0,automatic_warhead_detonations BIGINT NOT NULL DEFAULT 0,player_warhead_detonations BIGINT NOT NULL DEFAULT 0,mtf_main_waves BIGINT NOT NULL DEFAULT 0,chaos_main_waves BIGINT NOT NULL DEFAULT 0,mtf_reinforcement_waves BIGINT NOT NULL DEFAULT 0,chaos_reinforcement_waves BIGINT NOT NULL DEFAULT 0,CONSTRAINT fk_server_statistics_server FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS legacy_imports(import_key VARCHAR(191) NOT NULL PRIMARY KEY,imported_at TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP(6))",
             "CREATE INDEX IF NOT EXISTS ix_referrals_inviter ON referrals(inviter_player_id)",
+            PrivilegeGrantsUniqueIndexStatement,
+            PrivilegeGrantsActiveIndexStatement,
             "CREATE INDEX IF NOT EXISTS ix_punishments_player ON punishments(server_id,player_id,id DESC)",
             "CREATE INDEX IF NOT EXISTS ix_punishments_active_bans ON punishments(server_id,player_id,expires_at) WHERE type='ban'",
             "CREATE INDEX IF NOT EXISTS ix_player_statistics_last_seen ON player_statistics(server_id,last_seen)",
         };
+
+        private const string PrivilegeGrantsTableStatement =
+            "CREATE TABLE IF NOT EXISTS privilege_grants(" +
+            "id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY," +
+            "subject_type VARCHAR(16) NOT NULL CHECK(subject_type IN ('steam','discord'))," +
+            "subject_id VARCHAR(32) NOT NULL," +
+            "group_name VARCHAR(64) NOT NULL," +
+            "source_type VARCHAR(32) NOT NULL," +
+            "source_key VARCHAR(128) NOT NULL," +
+            "granted_at TIMESTAMP(6) WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP(6)," +
+            "expires_at TIMESTAMP(6) WITHOUT TIME ZONE NULL," +
+            "revoked_at TIMESTAMP(6) WITHOUT TIME ZONE NULL)";
+
+        private const string PrivilegeGrantsUniqueIndexStatement =
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_privilege_grants_source " +
+            "ON privilege_grants(subject_type,subject_id,LOWER(group_name),source_type,source_key)";
+
+        private const string PrivilegeGrantsActiveIndexStatement =
+            "CREATE INDEX IF NOT EXISTS ix_privilege_grants_active_subject " +
+            "ON privilege_grants(subject_type,subject_id,expires_at) WHERE revoked_at IS NULL";
     }
 }

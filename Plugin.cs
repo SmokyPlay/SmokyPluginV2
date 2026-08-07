@@ -82,7 +82,7 @@ namespace SmokyPluginV2
         public override string Author => "Smoky";
 
         /// <inheritdoc />
-        public override Version Version => new(0, 25, 3);
+        public override Version Version => new(0, 27, 2);
 
         /// <inheritdoc />
         public override Version RequiredExiledVersion => new(9, 14, 2);
@@ -98,6 +98,7 @@ namespace SmokyPluginV2
                 {
                     SharedDatabaseSettings sharedDatabaseSettings = SharedDatabaseConfig.Load();
                     databaseService = new PostgreSqlService(sharedDatabaseSettings, Config.Database.ServerName);
+                    databaseService.PlayerStatisticsChanged += OnPlayerStatisticsChanged;
                     referralService = new ReferralService(
                         databaseService,
                         Config.EarnedPrivileges?.Referrals);
@@ -124,6 +125,8 @@ namespace SmokyPluginV2
                     accountLinkService = null;
                     referralService?.Dispose();
                     referralService = null;
+                    if (databaseService != null)
+                        databaseService.PlayerStatisticsChanged -= OnPlayerStatisticsChanged;
                     databaseService?.Dispose();
                     databaseService = null;
                 }
@@ -276,6 +279,8 @@ namespace SmokyPluginV2
             accountLinkService?.Dispose();
             accountLinkService = null;
 
+            if (databaseService != null)
+                databaseService.PlayerStatisticsChanged -= OnPlayerStatisticsChanged;
             databaseService?.Dispose();
             databaseService = null;
 
@@ -302,6 +307,11 @@ namespace SmokyPluginV2
 
             Instance = null;
             base.OnDisabled();
+        }
+
+        private void OnPlayerStatisticsChanged()
+        {
+            rolePreferenceService?.RequestTowerLeaderboardRefresh();
         }
 
         internal void ReloadRolePreferenceConfiguration()

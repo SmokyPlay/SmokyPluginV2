@@ -90,7 +90,11 @@ namespace SmokyPluginV2.Referrals
                 return false;
             }
 
-            return database.TryGetOrCreateReferralStatus(discordUserId, out status, out error);
+            return database.TryGetOrCreateReferralStatus(
+                discordUserId,
+                EarnedPrivilegeGroupName,
+                out status,
+                out error);
         }
 
         public void OnPlaytimePersisted(string playerUserId, long addedPlaytimeSeconds)
@@ -115,12 +119,30 @@ namespace SmokyPluginV2.Referrals
             if (transition == null || !transition.InviteeQualified)
                 return;
 
-            Plugin.Instance?.PlayerAccess?.SynchronizeBySteamId(playerUserId);
+            if (transition.InviteeJustQualified)
+                Plugin.Instance?.PlayerAccess?.SynchronizeBySteamId(playerUserId);
             if (transition.RewardThresholdReached &&
                 !string.IsNullOrWhiteSpace(transition.InviterPlayerUserId))
             {
-                Plugin.Instance?.PlayerAccess?.SynchronizeBySteamId(
-                    transition.InviterPlayerUserId);
+                string groupName = EarnedPrivilegeGroupName;
+                if (!database.TryGrantPermanentSteamPrivilege(
+                        transition.InviterPlayerUserId,
+                        groupName,
+                        "earned_referrals",
+                        out bool inserted,
+                        out error))
+                {
+                    Log.Error(
+                        $"[Referrals] Could not grant {groupName} to " +
+                        $"{transition.InviterPlayerUserId}: {error}");
+                    return;
+                }
+
+                if (inserted)
+                {
+                    Plugin.Instance?.PlayerAccess?.SynchronizeBySteamId(
+                        transition.InviterPlayerUserId);
+                }
             }
         }
 
@@ -208,6 +230,73 @@ namespace SmokyPluginV2.Referrals
 
         public int CodeEntryMaxMinutes =>
             Math.Max(0, (settings ?? new ReferralSettings()).CodeEntryMaxMinutes);
+
+        public double PendingReferralWeight
+        {
+            get
+            {
+                double value = (settings ?? new ReferralSettings()).PendingReferralWeight;
+                return value > 0 && !double.IsNaN(value) && !double.IsInfinity(value)
+                    ? value
+                    : 0;
+            }
+        }
+
+        public int InGameMaximumDisplayedParticipants =>
+            Math.Max(0, (settings ?? new ReferralSettings()).InGameMaximumDisplayedParticipants);
+
+        public string EarnedPrivilegeGroupName =>
+            (Plugin.Instance?.Config?.EarnedPrivileges?.GroupName ?? string.Empty).Trim();
+
+        public double EarnedPrivilegeWeight
+        {
+            get
+            {
+                RolePreferenceSettings rolePreferences =
+                    Plugin.Instance?.Config?.RolePreferences ?? new RolePreferenceSettings();
+                string groupName = EarnedPrivilegeGroupName;
+                double fallback = IsValidWeight(rolePreferences.DefaultWeight)
+                    ? rolePreferences.DefaultWeight
+                    : 1d;
+                if (string.IsNullOrWhiteSpace(groupName) || rolePreferences.PriorityTiers == null)
+                    return fallback;
+
+                double[] matchingWeights = rolePreferences.PriorityTiers
+                    .Where(tier =>
+                        tier?.Groups != null &&
+                        tier.Groups.Any(group => string.Equals(
+                            group?.Trim(),
+                            groupName,
+                            StringComparison.OrdinalIgnoreCase)) &&
+                        IsValidWeight(tier.Weight))
+                    .Select(tier => tier.Weight)
+                    .ToArray();
+                return matchingWeights.Length == 0 ? fallback : matchingWeights.Max();
+            }
+        }
+
+        public bool TryGetOrCreateStatus(
+            string playerUserId,
+            out ReferralStatus status,
+            out string error)
+        {
+            ReferralSettings current = settings ?? new ReferralSettings();
+            if (!current.IsEnabled)
+            {
+                status = null;
+                error = "Реферальная программа отключена.";
+                return false;
+            }
+
+            return database.TryGetOrCreateReferralStatus(
+                playerUserId,
+                EarnedPrivilegeGroupName,
+                out status,
+                out error);
+        }
+
+        private static bool IsValidWeight(double value) =>
+            value > 0 && !double.IsNaN(value) && !double.IsInfinity(value);
 
         private void ResetRoundUses()
         {

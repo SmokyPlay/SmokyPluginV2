@@ -65,6 +65,44 @@ namespace SmokyPluginV2.Statistics
         public long ChaosReinforcementWaves { get; set; }
     }
 
+    internal enum LeaderboardCategory
+    {
+        Playtime,
+        Kills,
+        Escapes,
+        FastestEscape,
+        Snake,
+    }
+
+    internal enum LeaderboardEscapeRole
+    {
+        None,
+        ClassD,
+        Scientist,
+        Both,
+    }
+
+    internal sealed class LeaderboardEntry
+    {
+        public string Nickname { get; set; }
+        public long Value { get; set; }
+        public LeaderboardEscapeRole EscapeRole { get; set; }
+    }
+
+    internal sealed class LeaderboardRecord
+    {
+        private readonly Dictionary<LeaderboardCategory, List<LeaderboardEntry>> entries =
+            new Dictionary<LeaderboardCategory, List<LeaderboardEntry>>();
+
+        public IReadOnlyList<LeaderboardEntry> GetEntries(LeaderboardCategory category) =>
+            entries.TryGetValue(category, out List<LeaderboardEntry> result)
+                ? result
+                : Array.Empty<LeaderboardEntry>();
+
+        public void SetEntries(LeaderboardCategory category, List<LeaderboardEntry> value) =>
+            entries[category] = value ?? new List<LeaderboardEntry>();
+    }
+
     internal sealed class PlayerStatDelta
     {
         public Dictionary<string, long> Add { get; } = new Dictionary<string, long>();

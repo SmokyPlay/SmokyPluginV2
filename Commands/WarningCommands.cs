@@ -73,9 +73,12 @@ namespace SmokyPluginV2.Commands
             };
             if (!service.TryAdd(record, out response)) return false;
             Plugin.Instance?.WarningNotifications?.NotifyIssuedWarning(record, online ? target : null, moderator.Nickname);
+            string moderatorText = moderator.IsServer
+                ? "**Dedicated Server**"
+                : $"**{DiscordLogService.Escape(moderator.Nickname)}** (`{DiscordLogService.Escape(moderator.UserId)}`)";
             Plugin.Instance?.DiscordLogs?.LogModeration("Предупреждение игроку",
                 $"**Игрок:** **{DiscordLogService.Escape(string.IsNullOrWhiteSpace(nickname) ? "оффлайн-игрок" : nickname)}** (`{DiscordLogService.Escape(userId)}`)\n" +
-                $"**Модератор:** **{DiscordLogService.Escape(moderator.Nickname)}** (`{DiscordLogService.Escape(moderator.UserId)}`)\n" +
+                $"**Модератор:** {moderatorText}\n" +
                 $"**ID наказания:** `#{record.Id}`\n**Причина:** {DiscordLogService.Escape(record.Reason)}");
             response = online
                 ? $"Игроку {nickname} ({userId}) выдано предупреждение #{record.Id}."
@@ -309,8 +312,7 @@ namespace SmokyPluginV2.Commands
         public static string NormalizeUserId(string id)
         {
             string normalized = (id ?? string.Empty).Trim();
-            if (normalized.EndsWith("@steam", StringComparison.OrdinalIgnoreCase)) return normalized;
-            return normalized.All(char.IsDigit) && normalized.Length == 17 ? normalized + "@steam" : normalized;
+            return SteamIdCommandParser.TryParse(normalized, out string userId) ? userId : normalized;
         }
         public static string NormalizePlayerSelector(string selector) => (selector ?? string.Empty).Trim().Trim('.');
         private static string FormatAgo(TimeSpan value) => value.TotalDays >= 1 ? $"{value.TotalDays:0.#} дн. назад" : value.TotalHours >= 1 ? $"{value.TotalHours:0.#} ч. назад" : $"{Math.Max(0, value.TotalMinutes):0} мин. назад";

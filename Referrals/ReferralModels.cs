@@ -9,6 +9,8 @@ namespace SmokyPluginV2.Referrals
 
         public string ReferralCode { get; set; }
 
+        public bool HasReferralPrivilege { get; set; }
+
         public IReadOnlyList<ReferralParticipant> Participants { get; set; } =
             Array.Empty<ReferralParticipant>();
     }
@@ -38,5 +40,7 @@ namespace SmokyPluginV2.Referrals
         public bool RewardThresholdReached { get; set; }
 
         public bool InviteeQualified { get; set; }
+
+        public bool InviteeJustQualified { get; set; }
     }
 }

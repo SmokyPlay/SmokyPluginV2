@@ -84,17 +84,8 @@ namespace SmokyPluginV2.Commands
             onlinePlayer = null;
             error = null;
 
-            string steamId = selector;
-            int providerSeparator = steamId.IndexOf('@');
-            string provider = providerSeparator >= 0 ? steamId.Substring(providerSeparator) : string.Empty;
-            if (providerSeparator >= 0)
-                steamId = steamId.Substring(0, providerSeparator);
-
-            bool validSteamId = steamId.Length == 17 && steamId.All(char.IsDigit) &&
-                (provider.Length == 0 || provider.Equals("@steam", StringComparison.OrdinalIgnoreCase));
-            if (validSteamId)
+            if (SteamIdCommandParser.TryParse(selector, out userId))
             {
-                userId = PostgreSqlService.ToExiledUserId(steamId);
                 onlinePlayer = Player.Get(userId);
                 return true;
             }

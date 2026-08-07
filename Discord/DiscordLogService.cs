@@ -576,7 +576,9 @@ namespace SmokyPluginV2.Discord
                         Plugin.Instance?.Config?.EarnedPrivileges?.GroupName,
                         referrals.CodeEntryMaxMinutes,
                         referrals.QualificationMinutes,
-                        referrals.RequiredReferrals),
+                        referrals.RequiredReferrals,
+                        referrals.PendingReferralWeight,
+                        referrals.EarnedPrivilegeWeight),
                     Ephemeral = true,
                 };
             }

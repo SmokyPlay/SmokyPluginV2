@@ -146,3 +146,40 @@ CREATE TABLE IF NOT EXISTS legacy_imports (
     import_key varchar(191) PRIMARY KEY,
     imported_at timestamp(6) without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
 );
+
+CREATE OR REPLACE FUNCTION smoky_notify_player_statistics_changed()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    PERFORM pg_notify(
+        'smoky_player_statistics_changed',
+        COALESCE(NEW.server_id, OLD.server_id)::text
+    );
+    RETURN COALESCE(NEW, OLD);
+END
+$$;
+
+DROP TRIGGER IF EXISTS smoky_player_statistics_changed ON player_statistics;
+CREATE TRIGGER smoky_player_statistics_changed
+AFTER INSERT OR UPDATE OR DELETE ON player_statistics
+FOR EACH ROW
+EXECUTE PROCEDURE smoky_notify_player_statistics_changed();
+
+CREATE OR REPLACE FUNCTION smoky_notify_statistics_privacy_changed()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF OLD.statistics_private IS DISTINCT FROM NEW.statistics_private THEN
+        PERFORM pg_notify('smoky_player_statistics_changed', '*');
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+DROP TRIGGER IF EXISTS smoky_statistics_privacy_changed ON players;
+CREATE TRIGGER smoky_statistics_privacy_changed
+AFTER UPDATE OF statistics_private ON players
+FOR EACH ROW
+EXECUTE PROCEDURE smoky_notify_statistics_privacy_changed();

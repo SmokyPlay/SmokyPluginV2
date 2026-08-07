@@ -23,6 +23,35 @@ namespace SmokyPluginV2.Privileges
             settings = reloadedSettings ?? new EarnedPrivilegeSettings();
         }
 
+        public void OnPlaytimePersisted(string playerUserId)
+        {
+            EarnedPrivilegeSettings current = settings ?? new EarnedPrivilegeSettings();
+            if (current.RequiredHours <= 0 ||
+                double.IsNaN(current.RequiredHours) ||
+                double.IsInfinity(current.RequiredHours) ||
+                string.IsNullOrWhiteSpace(current.GroupName))
+            {
+                return;
+            }
+
+            long requiredSeconds = (long)Math.Ceiling(
+                Math.Min(current.RequiredHours, long.MaxValue / 3600d) * 3600d);
+            if (!database.TryGrantEarnedPlaytimePrivilege(
+                    playerUserId,
+                    Math.Max(1, requiredSeconds),
+                    current.GroupName,
+                    out bool inserted,
+                    out string error))
+            {
+                Exiled.API.Features.Log.Error(
+                    $"[Privileges] Playtime grant check failed for {playerUserId}: {error}");
+                return;
+            }
+
+            if (inserted)
+                Plugin.Instance?.PlayerAccess?.SynchronizeBySteamId(playerUserId);
+        }
+
         public bool TryResolveBySteamId(
             string playerUserId,
             out PlayerAccessSnapshot snapshot,
@@ -115,13 +144,6 @@ namespace SmokyPluginV2.Privileges
             }
 
             EarnedPrivilegeSettings currentSettings = settings ?? new EarnedPrivilegeSettings();
-            string groupName = (currentSettings.GroupName ?? string.Empty).Trim();
-            if (groupName.Length > 64)
-            {
-                error = "Название группы привилегии не может быть длиннее 64 символов.";
-                return false;
-            }
-
             HashSet<string> steamPrivilegeGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             HashSet<string> discordPrivilegeGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             HashSet<string> managedDiscordGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -129,7 +151,6 @@ namespace SmokyPluginV2.Privileges
             if (!TryResolveSteamPrivileges(
                     identity,
                     currentSettings,
-                    groupName,
                     steamPrivilegeGroups,
                     managedDiscordGroups,
                     pendingRevocations,
@@ -180,17 +201,14 @@ namespace SmokyPluginV2.Privileges
                 return true;
             }
 
-            // Each persistent privilege source finalizes its own records here. No
-            // donation source exists yet, so a non-empty collection is rejected
-            // instead of silently losing a future PostgreSQL state transition.
-            error = "Для источника отзыва привилегии не настроена фиксация в PostgreSQL.";
-            return false;
+            return database.TryFinalizePrivilegeRevocations(
+                revocations.Select(revocation => revocation.SourceId),
+                out error);
         }
 
         private bool TryResolveSteamPrivileges(
             PlayerAccessIdentity identity,
             EarnedPrivilegeSettings currentSettings,
-            string groupName,
             ISet<string> result,
             ISet<string> managedResult,
             ICollection<PendingPrivilegeRevocation> pendingRevocations,
@@ -206,30 +224,36 @@ namespace SmokyPluginV2.Privileges
                 return true;
             }
 
-            if (!database.TryGetTotalPlaytimeSeconds(identity.PlayerId, out totalPlaytimeSeconds, out error))
+            if (!database.TryGetPrivilegeGrants(
+                    "steam",
+                    identity.PlayerUserId,
+                    out IReadOnlyCollection<string> activeGroups,
+                    out IReadOnlyCollection<string> managedGroups,
+                    out IReadOnlyCollection<PendingPrivilegeRevocation> storedRevocations,
+                    out error))
+            {
                 return false;
+            }
 
-            long requiredSeconds = currentSettings.RequiredHours > 0
-                ? (long)Math.Ceiling(Math.Min(currentSettings.RequiredHours, long.MaxValue / 3600d) * 3600d)
-                : long.MaxValue;
-            bool earnedByPlaytime = totalPlaytimeSeconds >= requiredSeconds;
-            bool earnedByReferrals = false;
+            result.UnionWith(activeGroups);
+            managedResult.UnionWith(managedGroups);
+            foreach (PendingPrivilegeRevocation revocation in storedRevocations)
+                pendingRevocations.Add(revocation);
+
             ReferralSettings referralSettings = currentSettings.Referrals ?? new ReferralSettings();
             if (referralSettings.IsEnabled)
             {
                 long qualificationSeconds = Math.Max(1, referralSettings.QualificationMinutes) * 60L;
-                if (!database.TryGetReferralAccessState(
-                        identity.PlayerId,
+                if (!database.TryIsPendingReferral(
+                        identity.PlayerUserId,
                         qualificationSeconds,
-                        out ReferralAccessState referralState,
+                        out bool isPendingReferral,
                         out error))
                 {
                     return false;
                 }
 
-                earnedByReferrals = referralState.QualifiedReferralCount >=
-                    Math.Max(1, referralSettings.RequiredReferrals);
-                if (referralState.IsPendingInvitee &&
+                if (isPendingReferral &&
                     referralSettings.PendingReferralWeight > 0 &&
                     !double.IsNaN(referralSettings.PendingReferralWeight) &&
                     !double.IsInfinity(referralSettings.PendingReferralWeight))
@@ -238,29 +262,39 @@ namespace SmokyPluginV2.Privileges
                 }
             }
 
-            if (!string.IsNullOrWhiteSpace(groupName) &&
-                (earnedByPlaytime || earnedByReferrals))
-            {
-                result.Add(groupName);
-            }
-
-            // Steam-bound donations will also contribute active groups, managed
-            // groups and source-id revocations here when that source is added.
-
             error = null;
             return true;
         }
 
-        private static bool TryResolveDiscordPrivileges(
+        private bool TryResolveDiscordPrivileges(
             PlayerAccessIdentity identity,
             ISet<string> result,
             ISet<string> managedResult,
             ICollection<PendingPrivilegeRevocation> pendingRevocations,
             out string error)
         {
-            // Active Discord-bound donations will be added to result. Expired,
-            // non-revoked donations will add their group to managedResult and a
-            // source-id entry to pendingRevocations when that source is implemented.
+            if (identity.DiscordUserId == 0)
+            {
+                error = null;
+                return true;
+            }
+
+            if (!database.TryGetPrivilegeGrants(
+                    "discord",
+                    identity.DiscordUserId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    out IReadOnlyCollection<string> activeGroups,
+                    out IReadOnlyCollection<string> managedGroups,
+                    out IReadOnlyCollection<PendingPrivilegeRevocation> storedRevocations,
+                    out error))
+            {
+                return false;
+            }
+
+            result.UnionWith(activeGroups);
+            managedResult.UnionWith(managedGroups);
+            foreach (PendingPrivilegeRevocation revocation in storedRevocations)
+                pendingRevocations.Add(revocation);
+
             error = null;
             return true;
         }

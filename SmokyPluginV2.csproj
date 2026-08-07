@@ -160,11 +160,13 @@
     <Compile Include="Commands\AccountLinkCommands.cs" />
     <Compile Include="Commands\EventLobbyCommand.cs" />
     <Compile Include="Commands\MyWarningsCommand.cs" />
+    <Compile Include="Commands\PlayerStatisticsCommands.cs" />
     <Compile Include="Commands\RolePriorityCommand.cs" />
     <Compile Include="Commands\JanitorCardCommand.cs" />
     <Compile Include="Commands\ReferralCommand.cs" />
     <Compile Include="Commands\StatisticsRecordingCommand.cs" />
     <Compile Include="Commands\StatisticsClearCommand.cs" />
+    <Compile Include="Commands\SteamIdCommandParser.cs" />
     <Compile Include="Commands\WarningCommands.cs" />
     <Compile Include="Config.cs" />
     <Compile Include="Database\PostgreSqlService.cs" />
@@ -207,6 +209,8 @@
     <Compile Include="RolePreferences\RolePreferenceSelection.cs" />
     <Compile Include="RolePreferences\RolePreferenceService.cs" />
     <Compile Include="RolePreferences\RolePreferenceTowerService.cs" />
+    <Compile Include="RolePreferences\TowerLeaderboardBoardFormatter.cs" />
+    <Compile Include="RolePreferences\TowerStatisticsBoardFormatter.cs" />
     <Compile Include="Statistics\StatisticsModels.cs" />
     <Compile Include="Statistics\StatisticsService.cs" />
   </ItemGroup>

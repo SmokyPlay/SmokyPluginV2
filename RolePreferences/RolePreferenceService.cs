@@ -105,6 +105,8 @@ namespace SmokyPluginV2.RolePreferences
             return false;
         }
 
+        internal void RequestTowerLeaderboardRefresh() => tower?.RequestLeaderboardRefresh();
+
         internal void BeginRoleAssignment()
         {
             if (!isRegistered)

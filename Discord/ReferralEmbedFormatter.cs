@@ -17,7 +17,9 @@ namespace SmokyPluginV2.Discord
             string privilegeGroupName,
             int codeEntryMaxMinutes,
             int qualificationMinutes,
-            int requiredReferrals)
+            int requiredReferrals,
+            double pendingReferralWeight,
+            double earnedPrivilegeWeight)
         {
             long requiredSeconds = Math.Max(1, qualificationMinutes) * 60L;
             int requiredCount = Math.Max(1, requiredReferrals);
@@ -27,12 +29,11 @@ namespace SmokyPluginV2.Discord
                 item.TotalPlaytimeSeconds >= requiredSeconds);
             int pending = Math.Max(0, participants.Count - qualified);
             string groupName = DisplayGroupName(privilegeGroupName);
-            string progress = qualified >= requiredCount
-                ? $"✅ Задача выполнена — привилегия **{groupName}** получена!\n" +
-                  $"Подтверждено: **{qualified}**\n" +
-                  $"Ожидают подтверждения: **{pending}**"
-                : $"Подтверждено: **{qualified}/{requiredCount}**\n" +
-                  $"Ожидают подтверждения: **{pending}**";
+            string progress = (status?.HasReferralPrivilege == true
+                    ? $"✅ Привилегия **{groupName}** получена!\n"
+                    : string.Empty) +
+                $"Подтверждено: **{qualified}/{requiredCount}**\n" +
+                $"Ожидают подтверждения: **{pending}**";
 
             return new DiscordEmbed
             {
@@ -40,10 +41,10 @@ namespace SmokyPluginV2.Discord
                 Description =
                     $"Приглашайте друзей и получите привилегию **{groupName}** после " +
                     $"**{requiredCount}** подтверждённых приглашений.\n" +
-                    "Подробнее про привилегию: https://discord.com/channels/955066806773616660/957612549556277309/957672883914698763\n\n" +
+                    $"Эта привилегия выдаётся навсегда и даёт повышенный шанс получить выбранную роль — преимущество **x{FormatWeight(earnedPrivilegeWeight)}**.\n\n" +
                     $"Новый игрок должен ввести ваш код в течение первых **{Math.Max(0, codeEntryMaxMinutes)} минут** игры на сервере.\n" +
                     "После активации кода и до подтверждения приглашения он получит:\n" +
-                    "1. Повышенный шанс получить выбранную роль (преимущество x1.25);\n" +
+                    $"1. Повышенный шанс получить выбранную роль (преимущество x{FormatWeight(pendingReferralWeight)});\n" +
                     "2. Карту уборщика один раз за раунд по команде `.janitorcard` или `.jc`.\n" +
                     $"Приглашение подтверждается после **{Math.Max(1, qualificationMinutes)} минут** общего игрового времени.\n\n" +
                     "Код для копирования:\n" +
@@ -139,6 +140,11 @@ namespace SmokyPluginV2.Discord
                 return minutes > 0 ? $"{hours} ч {minutes} мин" : $"{hours} ч";
             return $"{minutes} мин";
         }
+
+        private static string FormatWeight(double weight) =>
+            weight > 0 && !double.IsNaN(weight) && !double.IsInfinity(weight)
+                ? weight.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)
+                : "0";
 
         private static string PostgreSqlDisplayId(string playerUserId)
         {

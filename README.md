@@ -2,7 +2,7 @@
 
 EXILED 9.14.2 plugin for SCP: Secret Laboratory 14.2.7.
 
-Version 0.25.3 stores player statistics, server statistics, account links, referrals and moderation history in PostgreSQL. The access synchronizer supports both Steam and Discord game authentication without creating player profiles for unlinked Discord accounts. Multiple SCP:SL instances share one database configuration and are separated automatically by their game ports.
+Version 0.27.2 stores player statistics, server statistics, account links, referrals and moderation history in PostgreSQL. The access synchronizer supports both Steam and Discord game authentication without creating player profiles for unlinked Discord accounts. Multiple SCP:SL instances share one database configuration and are separated automatically by their game ports.
 
 ## Current features
 
@@ -12,6 +12,8 @@ Version 0.25.3 stores player statistics, server statistics, account links, refer
 - Compact aggregate player statistics, keyed by server and Steam ID, including the best Chaos device Snake score; no per-round history rows are retained.
 - Aggregate server statistics, including round outcomes, round duration, warhead detonations and separate MTF/Chaos main and reinforcement waves.
 - Discord `/stats` and `/server-stats` embeds, with global per-player privacy controlled by `/stats-privacy`.
+- Player-console `.stats` command for compact personal statistics, case-insensitive online nickname/partial-nickname lookup, and online or offline SteamID64 lookup.
+- Player-console `.statsprivacy` / `.sp` toggle controlling the same global privacy setting used by Discord statistics.
 - Configurable recurring server-wide broadcasts.
 - `statstoggle` (aliases: `togglestats`, `ts`) temporarily pauses statistics for the current round and requires its own EXILED permission.
 - `clearstats <game ID|SteamID64>` (aliases: `resetstats`, `cs`) clears one player's statistics only for the current server and requires `smokyplugin.statistics.clear`.
@@ -131,6 +133,7 @@ smoky_plugin_v2:
       qualification_minutes: 120
       required_referrals: 5
       pending_referral_weight: 1.25
+      in_game_maximum_displayed_participants: 10
   end_round_friendly_fire:
     is_enabled: true
   late_join_spawn:
@@ -164,6 +167,36 @@ smoky_plugin_v2:
       class_d_zone: { x: 50.9, y: 1018.15, z: -48.5 }
       facility_guard_zone: { x: 56.3, y: 1018.15, z: -48.5 }
       zone_radius: 1.4
+      statistics_board:
+        is_enabled: true
+        use_dynamic_wall_placement: true
+        wall_side: PositiveX
+        wall_height: 1.75
+        wall_horizontal_offset: 0
+        wall_inset: 0.035
+        wall_text_scale: { x: 0.07875, y: 0.07875, z: 0.07875 }
+        wall_display_width: 440
+        wall_display_height: 360
+        navigation_local_y: -0.78
+        navigation_local_z: -0.045
+        navigation_button_height: 0.34
+        navigation_button_depth: 0.12
+        navigation_text_scale: { x: 0.0525, y: 0.0525, z: 0.0525 }
+      leaderboard_board:
+        is_enabled: true
+        use_dynamic_wall_placement: true
+        wall_side: PositiveZ
+        wall_height: 1.75
+        wall_horizontal_offset: 0
+        wall_inset: 0.035
+        wall_text_scale: { x: 0.07875, y: 0.07875, z: 0.07875 }
+        wall_display_width: 440
+        wall_display_height: 360
+        navigation_local_y: -0.58
+        navigation_local_z: -0.045
+        navigation_button_height: 0.34
+        navigation_button_depth: 0.12
+        navigation_text_scale: { x: 0.0525, y: 0.0525, z: 0.0525 }
       lobby_timer_countdown: 'Раунд начнется через {time} секунд'
       lobby_timer_round_paused: 'Запуск раунда приостановлен'
       lobby_timer_round_starting: 'Раунд начинается!'
@@ -231,6 +264,8 @@ smoky_plugin_v2:
 
 During `WaitingForPlayers`, every connected player is assigned Tutorial once when they first enter the current tower lobby, and the game places them at its native Tutorial spawn; the lobby update loop never forces their role back afterward. The plugin does not override player coordinates. Remaining in a colored zone for `selection_hold_seconds` changes the preference; moving away does not erase it, and entering another zone replaces it. A selection is valid only for the upcoming round and is cleared when the next lobby begins. The hint reads the game's own `RoundStart.NetworkTimer`, so the displayed duration follows the server's native lobby configuration and lobby pause state.
 
+The tower statistics board uses one shared `TextToy`, but sends its text as a client-specific fake SyncVar. Every participant therefore sees their own three-page player statistics and keeps an independent page/section selection. Four invisible `InteractableToy` button areas over the rendered navigation respond to the use key; the server section has one page and ignores arrow presses. PostgreSQL reads and the statistics-writer flush run away from the game thread. `position_offset` is relative to the native Tutorial spawn, while button offsets are local meter offsets in the configured board rotation; adjust these values to align the overlay and interaction row with the physical whiteboard after the first in-server visual check.
+
 The displayed probability is calculated exactly for the same sequential weighted draw without replacement used at round start. Candidates with the same effective weight are grouped, and a dynamic program evaluates every reachable winner-count state. The value is deterministic and recalculated whenever a player joins, leaves, changes group, or changes selection.
 
 During the tower lobby, a command sender with the EXILED permission `smokyplugin.eventlobby` may run `eventlobby` (aliases: `elobby`, `eventbriefing`) in Remote Admin. The first use locks the native lobby countdown, replaces the selected-class line with `announcement_text`, hides the probability and competition lines, and sets the non-persistent `Player.IsMuted` flag for tower participants outside the Remote Admin groups listed in `mute_exempt_groups`. Players who join while the briefing is active receive the same temporary mute. The second use or round start unlocks the lobby and removes only mutes owned by this feature; a player present in the server's `mutes.txt` is never unmuted. The persistent `Player.Mute()` and `Player.UnMute()` APIs are not used.
@@ -286,19 +321,22 @@ Other account commands:
 /unlink        Discord: remove the link
 .unlink        game console: remove the link
 /referral      Discord: show the permanent referral code and progress
+.ref           game console: show the same referral code, rules and progress without Discord linking
 .ref CODE      game console: accept a referral
 .janitorcard   game console: receive one janitor keycard per round while the referral is pending (alias: .jc)
 ```
 
-Codes are generated with `RandomNumberGenerator`, are bound to the Discord user who requested them, expire after `code_lifetime_minutes`, and are consumed once. Links are one-to-one: a Steam account and a Discord account can each appear only once.
+Account-linking codes are generated with `RandomNumberGenerator`, are bound to the Discord user who requested them, expire after `code_lifetime_minutes`, and are consumed once. Links are one-to-one: a Steam account and a Discord account can each appear only once.
 
-On every player verification the plugin resolves the Steam/Discord identity first, then fetches the Discord member and resolves PostgreSQL privilege sources in parallel. The member is fetched at most once and the resulting role snapshot is passed into reconciliation. Active Steam- and Discord-bound privileges are combined, missing roles are queued for assignment, and the highest matching `role_groups` entry is applied in the game without waiting for the role operations to finish. `earned_privileges.group_name` is active after either `earned_privileges.required_hours` or the configured number of qualified referrals; no computed privilege is stored in another table. After `reload remoteadmin`, the same live synchronization is repeated for every linked online player. With `preserve_native_group: true`, a Steam UserId explicitly present in `config_remoteadmin.txt` keeps the game's native group, while managed Discord roles are still reconciled.
+On every player verification the plugin resolves the Steam/Discord identity first, then fetches the Discord member and resolves PostgreSQL privilege sources in parallel. The member is fetched at most once and the resulting role snapshot is passed into reconciliation. Active Steam- and Discord-bound grants from `privilege_grants` are combined by group name, missing roles are queued for assignment, and the highest matching `role_groups` entry is applied in the game without waiting for the role operations to finish. Multiple active grants may provide the same group without applying it more than once. After `reload remoteadmin`, the same live synchronization is repeated for every linked online player. With `preserve_native_group: true`, a Steam UserId explicitly present in `config_remoteadmin.txt` keeps the game's native group, while managed Discord roles are still reconciled.
 
 Discord reconciliation returns a per-role report distinguishing successful changes, already satisfied state, roles preserved by another active privilege, failures, and cancellation. Privilege sources can attach their persistent source IDs to pending revocations; only a successfully settled removal is passed to the PostgreSQL finalization hook. The current playtime/referral privilege never requests removal, so a manually assigned matching Discord role remains untouched during normal synchronization.
 
 When a user joins the configured Discord guild, `GUILD_MEMBER_ADD` starts a Discord-only privilege synchronization. The complete role list from the Gateway member event is reused instead of issuing another REST lookup. It restores the link role and all active Steam- and Discord-bound privilege roles without touching the player's current in-game group. Members waiting for Discord Membership Screening are synchronized after their `pending` state clears.
 
-A referral code is permanent and is generated lazily by `/referral` for a linked account. Each player can accept one code with `.ref CODE` before `code_entry_max_minutes`; the number of players using an inviter's code is unlimited. Qualification is derived from aggregate playtime in `player_statistics`; no qualified flag or duplicate playtime is stored. Pending invitees receive `pending_referral_weight`, while the inviter receives the earned group after `required_referrals` invitees each reach `qualification_minutes`.
+A referral code is permanent, belongs to the Steam player profile and is generated lazily by either the in-game `.ref` command or Discord `/referral` for a linked account. The zero-argument `.ref` response uses the configured entry window, qualification time, required referral count, pending role weight, privilege group, the group's role-selection weight and participant display limit; `.ref CODE` accepts another player's code. Its "privilege received" state comes from an active `privilege_grants` row, while the qualified referral counter is still displayed independently. Each player can accept one code before `code_entry_max_minutes`; the number of players using an inviter's code is unlimited. Qualification is derived from aggregate playtime in `player_statistics`; no qualified flag or duplicate playtime is stored. Pending invitees receive `pending_referral_weight`. Reaching either `earned_privileges.required_hours` or the referral threshold inserts a permanent Steam grant with source `earned_playtime` or `earned_referrals`; a player who fulfills both conditions keeps both grant records, while the effective `group_name` remains unique.
+
+New grants are committed before Steam-ID synchronization is started, so linked Discord roles can be updated even when the player is offline in SCP:SL. Previously stored grants remain active when earning thresholds are changed; changing the configuration does not run a mass grant scan.
 
 On unlink, the old Discord ID is retained for the cleanup pass. The dedicated link role and every currently active Steam-bound privilege role are removed from that Discord account; Discord-bound and unrelated roles remain untouched. The same Steam privilege snapshot is reused to recalculate an online game player after the Discord account is no longer linked.
 

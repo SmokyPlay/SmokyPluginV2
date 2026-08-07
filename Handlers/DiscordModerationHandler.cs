@@ -42,12 +42,13 @@ namespace SmokyPluginV2.Handlers
         private void OnKicking(KickingEventArgs ev)
         {
             if (!ev.IsAllowed || IsBanDisconnectReason(ev.Reason)) return;
-            string moderatorUserId = SenderId(ev.CommandSender, ev.Player);
-            bool automaticAfk = IsServerSender(ev.CommandSender) && IsAfkReason(ev.Reason);
+            CommandSender commandSender = ev.CommandSender as CommandSender;
+            bool moderatorIssued = IsModeratorIssued(commandSender);
+            string moderatorUserId = moderatorIssued ? commandSender.SenderId : "server";
             string targetUserId = ev.Target?.UserId;
             if (Plugin.Instance?.PlayerAccess?.TryGetResolvedSteamUserId(ev.Target, out string targetSteamUserId) == true)
                 targetUserId = targetSteamUserId;
-            pendingKicks[Key(ev.Target)] = new PendingKick(ev.Target, targetUserId, SenderText(ev.CommandSender, ev.Player), moderatorUserId, ev.Reason, automaticAfk);
+            pendingKicks[Key(ev.Target)] = new PendingKick(ev.Target, targetUserId, SenderText(ev.CommandSender, ev.Player), moderatorUserId, ev.Reason, moderatorIssued);
         }
 
         private void OnKicked(KickedEventArgs ev)
@@ -56,24 +57,22 @@ namespace SmokyPluginV2.Handlers
             if (pendingKicks.TryRemove(Key(ev.Player), out PendingKick pending))
             {
                 long? punishmentId = null;
-                if (!pending.IsAutomaticAfk)
+                if (pending.IsModeratorIssued)
                     punishmentId = Store(pending.TargetUserId, pending.Target?.Nickname, pending.ModeratorUserId, PunishmentType.Kick, pending.Reason, null);
                 Log("Кик игрока", pending.Target, pending.Moderator, "не применяется", pending.Reason, punishmentId);
             }
             else
             {
-                long? punishmentId = null;
-                if (!IsAfkReason(ev.Reason))
-                    punishmentId = Store(ev.Player?.UserId, ev.Player?.Nickname, "server", PunishmentType.Kick, ev.Reason, null);
-                Log("Кик игрока", ev.Player, "**Dedicated Server / неизвестно**", "не применяется", ev.Reason, punishmentId);
+                Log("Кик игрока", ev.Player, "**Система / неизвестно**", "не применяется", ev.Reason, null);
             }
         }
 
         private void OnBanned(BannedEventArgs ev)
         {
             if (ev.Details == null) return;
-            string issuerText = ev.Player != null && !ev.Player.IsHost ? DiscordLogService.PlayerText(ev.Player) :
-                string.IsNullOrWhiteSpace(ev.Details.Issuer) ? "**Dedicated Server / неизвестно**" : DiscordLogService.Escape(ev.Details.Issuer);
+            CommandSender commandSender = RemoteAdminCommandLoggingPatch.CurrentSender;
+            bool moderatorIssued = IsModeratorIssued(commandSender);
+            string issuerText = SenderText(commandSender, ev.Player);
             string reason = string.IsNullOrWhiteSpace(ev.Details.Reason) ? "не указана" : ev.Details.Reason;
             DateTime? expires = ev.Details.Expires > DateTime.UtcNow.Ticks ? new DateTime(ev.Details.Expires, DateTimeKind.Utc) : (DateTime?)null;
             string duration = expires.HasValue ? FormatDuration((long)Math.Ceiling((expires.Value - DateTime.UtcNow).TotalSeconds)) : "бессрочно";
@@ -90,7 +89,6 @@ namespace SmokyPluginV2.Handlers
                 return;
             }
 
-            string moderatorId = SenderId(RemoteAdminCommandLoggingPatch.CurrentSender, ev.Player);
             string targetUserId = ev.Target?.UserId ?? ev.Details.Id;
             string targetNickname = ev.Target?.Nickname;
             string displayUserId = ev.Details.Id;
@@ -101,7 +99,9 @@ namespace SmokyPluginV2.Handlers
                 targetNickname = GetLastKnownNickname(offlineSteamUserId);
             }
 
-            long? punishmentId = Store(targetUserId, ev.Target != null ? targetNickname : null, moderatorId, PunishmentType.Ban, reason, expires);
+            long? punishmentId = moderatorIssued
+                ? Store(targetUserId, ev.Target != null ? targetNickname : null, commandSender.SenderId, PunishmentType.Ban, reason, expires)
+                : null;
             if (ev.Target != null) Log("Бан игрока", ev.Target, issuerText, duration, reason, punishmentId);
             else DiscordLogService.Current?.LogModeration("Бан игрока",
                 $"**Игрок:** {OfflinePlayerText(targetNickname, displayUserId)}\n" +
@@ -220,14 +220,30 @@ namespace SmokyPluginV2.Handlers
             $"**{DiscordLogService.Escape(string.IsNullOrWhiteSpace(nickname) ? "Неизвестный игрок" : nickname)}** " +
             $"(`{DiscordLogService.Escape(userId)}`)";
 
-        private static string SenderText(ICommandSender sender, Exiled.API.Features.Player fallback) => sender is CommandSender commandSender
-            ? $"**{DiscordLogService.Escape(commandSender.Nickname)}** (`{DiscordLogService.Escape(commandSender.SenderId)}`)"
-            : fallback != null ? DiscordLogService.PlayerText(fallback) : "**Dedicated Server / неизвестно**";
+        private static string SenderText(ICommandSender sender, Exiled.API.Features.Player fallback)
+        {
+            if (IsServerSender(sender))
+                return "**Dedicated Server**";
 
-        private static string SenderId(ICommandSender sender, Exiled.API.Features.Player fallback) =>
-            IsServerSender(sender) ? "server" :
-            sender is CommandSender commandSender && !string.IsNullOrWhiteSpace(commandSender.SenderId) ? commandSender.SenderId :
-            fallback != null && !fallback.IsHost ? fallback.UserId : "server";
+            if (sender is CommandSender commandSender)
+            {
+                string nickname = string.IsNullOrWhiteSpace(commandSender.Nickname) ? "Неизвестный модератор" : commandSender.Nickname;
+                return string.IsNullOrWhiteSpace(commandSender.SenderId)
+                    ? $"**{DiscordLogService.Escape(nickname)}**"
+                    : $"**{DiscordLogService.Escape(nickname)}** (`{DiscordLogService.Escape(commandSender.SenderId)}`)";
+            }
+
+            if (fallback != null && !fallback.IsHost)
+            {
+                string nickname = string.IsNullOrWhiteSpace(fallback.Nickname) ? "Неизвестный модератор" : fallback.Nickname;
+                return $"**{DiscordLogService.Escape(nickname)}** (`{DiscordLogService.Escape(fallback.UserId)}`)";
+            }
+
+            return "**Система / неизвестно**";
+        }
+
+        private static bool IsModeratorIssued(CommandSender sender) =>
+            sender != null && !IsServerSender(sender) && !string.IsNullOrWhiteSpace(sender.SenderId);
 
         private static bool IsServerSender(ICommandSender sender) =>
             sender is ServerConsoleSender || sender == Exiled.API.Features.Server.Host?.Sender;
@@ -246,26 +262,16 @@ namespace SmokyPluginV2.Handlers
         private static bool IsBanDisconnectReason(string reason) => !string.IsNullOrWhiteSpace(reason) &&
             (reason.IndexOf("you have been banned", StringComparison.OrdinalIgnoreCase) >= 0 || reason.IndexOf("забан", StringComparison.OrdinalIgnoreCase) >= 0 || reason.IndexOf("заблокирован", StringComparison.OrdinalIgnoreCase) >= 0);
 
-        private static bool IsAfkReason(string reason)
-        {
-            if (string.IsNullOrWhiteSpace(reason)) return false;
-            return reason.IndexOf("afk", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   reason.IndexOf("away from keyboard", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   reason.IndexOf("неактив", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   reason.IndexOf("бездейств", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   reason.IndexOf("отсутстви", StringComparison.OrdinalIgnoreCase) >= 0;
-        }
-
         private sealed class PendingKick
         {
-            public PendingKick(Exiled.API.Features.Player target, string targetUserId, string moderator, string moderatorUserId, string reason, bool isAutomaticAfk)
-            { Target = target; TargetUserId = targetUserId; Moderator = moderator; ModeratorUserId = moderatorUserId; Reason = reason; IsAutomaticAfk = isAutomaticAfk; }
+            public PendingKick(Exiled.API.Features.Player target, string targetUserId, string moderator, string moderatorUserId, string reason, bool isModeratorIssued)
+            { Target = target; TargetUserId = targetUserId; Moderator = moderator; ModeratorUserId = moderatorUserId; Reason = reason; IsModeratorIssued = isModeratorIssued; }
             public Exiled.API.Features.Player Target { get; }
             public string TargetUserId { get; }
             public string Moderator { get; }
             public string ModeratorUserId { get; }
             public string Reason { get; }
-            public bool IsAutomaticAfk { get; }
+            public bool IsModeratorIssued { get; }
         }
     }
 }

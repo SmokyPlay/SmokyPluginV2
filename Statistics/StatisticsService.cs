@@ -290,13 +290,15 @@ namespace SmokyPluginV2.Statistics
                 return;
 
             string normalizedUserId = PostgreSqlService.NormalizeSteamId(userId);
-            if (string.IsNullOrWhiteSpace(normalizedUserId) ||
-                !activePocketStarts.TryGetValue(normalizedUserId, out DateTime startedUtc))
+            if (string.IsNullOrWhiteSpace(normalizedUserId))
                 return;
 
-            statistics.LongestPocketSeconds = Math.Max(
-                statistics.LongestPocketSeconds,
-                ElapsedSeconds(startedUtc, DateTime.UtcNow));
+            if (activePocketStarts.TryGetValue(normalizedUserId, out DateTime startedUtc))
+            {
+                statistics.LongestPocketSeconds = Math.Max(
+                    statistics.LongestPocketSeconds,
+                    ElapsedSeconds(startedUtc, DateTime.UtcNow));
+            }
         }
 
         public void OnWaveSpawned(SpawnableWaveBase wave)
@@ -715,7 +717,7 @@ namespace SmokyPluginV2.Statistics
 
         private void OnWarheadStopping(StoppingEventArgs ev)
         {
-            if (!IsRecording || !ev.IsAllowed || !IsRealPlayer(ev.Player))
+            if (!IsRecording || !Warhead.IsInProgress || !ev.IsAllowed || !IsRealPlayer(ev.Player))
                 return;
             SafePlayerUpdate(ev.Player.UserId, ev.Player.Nickname, new PlayerStatDelta().Increment("warhead_countdowns_stopped"), DateTime.UtcNow);
             lastWarheadStarterUserId = null;
@@ -904,6 +906,7 @@ namespace SmokyPluginV2.Statistics
                     database.UpdatePlayerStatistics(steamUserId, nickname, delta, now);
                     if (addedPlaytimeSeconds > 0)
                     {
+                        Plugin.Instance?.PlayerPrivileges?.OnPlaytimePersisted(steamUserId);
                         Plugin.Instance?.Referrals?.OnPlaytimePersisted(
                             steamUserId,
                             addedPlaytimeSeconds);

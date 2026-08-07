@@ -100,6 +100,9 @@ namespace SmokyPluginV2
 
         [Description("Temporary role-selection weight for an invited player until the referral qualifies.")]
         public double PendingReferralWeight { get; set; } = 1.25;
+
+        [Description("Maximum invited players displayed by the in-game .ref command. Set to 0 to display all participants.")]
+        public int InGameMaximumDisplayedParticipants { get; set; } = 10;
     }
 
     public sealed class GeneralBroadcastSettings
@@ -271,6 +274,144 @@ namespace SmokyPluginV2
         [Description("Event briefing lobby lock, voice restriction, and hint settings.")]
         public EventBriefingSettings EventBriefing { get; set; } = new EventBriefingSettings();
 
+        [Description("Personal and server statistics board displayed in the pre-round tower.")]
+        public TowerStatisticsBoardSettings StatisticsBoard { get; set; } = new TowerStatisticsBoardSettings();
+
+        [Description("Top-ten leaderboard displayed on the wall to the left of the statistics board.")]
+        public TowerLeaderboardBoardSettings LeaderboardBoard { get; set; } = new TowerLeaderboardBoardSettings();
+
+    }
+
+    public sealed class TowerStatisticsBoardSettings
+    {
+        [Description("Whether the interactive statistics board is enabled.")]
+        public bool IsEnabled { get; set; } = true;
+
+        [Description("Whether to find the selected tower wall dynamically from the calculated room centre.")]
+        public bool UseDynamicWallPlacement { get; set; } = true;
+
+        [Description("Tower wall used by the screen: PositiveX, NegativeX, PositiveZ, or NegativeZ. PositiveX is the wall shared by the Scientist and Facility Guard zones.")]
+        public string WallSide { get; set; } = "PositiveX";
+
+        [Description("Height of the screen centre above the calculated tower floor, in meters.")]
+        public float WallHeight { get; set; } = 1.75f;
+
+        [Description("Horizontal screen offset from the middle of the selected wall, in meters.")]
+        public float WallHorizontalOffset { get; set; } = 0f;
+
+        [Description("Distance from the wall surface toward the room, in meters.")]
+        public float WallInset { get; set; } = 0.035f;
+
+        [Description("Text scale used for dynamically placed wall statistics.")]
+        public RolePreferencePoint WallTextScale { get; set; } = new RolePreferencePoint(0.07875f, 0.07875f, 0.07875f);
+
+        [Description("Text canvas width used for dynamically placed wall statistics.")]
+        public float WallDisplayWidth { get; set; } = 440f;
+
+        [Description("Text canvas height used for dynamically placed wall statistics.")]
+        public float WallDisplayHeight { get; set; } = 360f;
+
+        [Description("Vertical offset of the separate navigation button row in meters.")]
+        public float NavigationLocalY { get; set; } = -0.78f;
+
+        [Description("Offset of the navigation buttons from the wall text plane in meters.")]
+        public float NavigationLocalZ { get; set; } = -0.045f;
+
+        [Description("Navigation button height in meters.")]
+        public float NavigationButtonHeight { get; set; } = 0.34f;
+
+        [Description("Navigation button interaction depth in meters.")]
+        public float NavigationButtonDepth { get; set; } = 0.12f;
+
+        [Description("Scale of the visible navigation labels.")]
+        public RolePreferencePoint NavigationTextScale { get; set; } = new RolePreferencePoint(0.0525f, 0.0525f, 0.0525f);
+
+        [Description("Fallback screen position relative to the calculated tower centre when dynamic wall placement is disabled.")]
+        public RolePreferencePoint PositionOffset { get; set; } = new RolePreferencePoint(4.08f, 1.05f, 3.35f);
+
+        [Description("Fallback screen rotation when dynamic wall placement is disabled.")]
+        public RolePreferencePoint Rotation { get; set; } = new RolePreferencePoint(0f, 90f, 0f);
+
+        [Description("Board text scale.")]
+        public RolePreferencePoint Scale { get; set; } = new RolePreferencePoint(0.05f, 0.05f, 0.05f);
+
+        [Description("Text canvas width.")]
+        public float DisplayWidth { get; set; } = 300f;
+
+        [Description("Text canvas height.")]
+        public float DisplayHeight { get; set; } = 260f;
+
+        [Description("Local vertical offset of the invisible navigation button row in meters.")]
+        public float ButtonLocalY { get; set; } = -0.72f;
+
+        [Description("Local outward offset of the invisible navigation buttons in meters.")]
+        public float ButtonLocalZ { get; set; } = -0.04f;
+
+        [Description("Interaction button height in meters.")]
+        public float ButtonHeight { get; set; } = 0.18f;
+
+        [Description("Interaction button depth in meters.")]
+        public float ButtonDepth { get; set; } = 0.10f;
+    }
+
+    public sealed class TowerLeaderboardBoardSettings
+    {
+        [Description("Whether the interactive leaderboard board is enabled.")]
+        public bool IsEnabled { get; set; } = true;
+
+        [Description("Whether to find the selected tower wall dynamically from the calculated room centre.")]
+        public bool UseDynamicWallPlacement { get; set; } = true;
+
+        [Description("Tower wall used by the leaderboard. PositiveZ is immediately left of the default PositiveX statistics wall when viewed from the room centre.")]
+        public string WallSide { get; set; } = "PositiveZ";
+
+        [Description("Height of the leaderboard centre above the calculated tower floor, in meters.")]
+        public float WallHeight { get; set; } = 1.75f;
+
+        [Description("Horizontal leaderboard offset from the middle of the selected wall, in meters.")]
+        public float WallHorizontalOffset { get; set; } = 0f;
+
+        [Description("Distance from the wall surface toward the room, in meters.")]
+        public float WallInset { get; set; } = 0.035f;
+
+        [Description("Text scale used for dynamically placed wall leaderboards.")]
+        public RolePreferencePoint WallTextScale { get; set; } = new RolePreferencePoint(0.07875f, 0.07875f, 0.07875f);
+
+        [Description("Text canvas width used for dynamically placed wall leaderboards.")]
+        public float WallDisplayWidth { get; set; } = 440f;
+
+        [Description("Text canvas height used for dynamically placed wall leaderboards.")]
+        public float WallDisplayHeight { get; set; } = 360f;
+
+        [Description("Vertical offset of the leaderboard navigation row in meters.")]
+        public float NavigationLocalY { get; set; } = -0.58f;
+
+        [Description("Offset of the leaderboard navigation buttons from the wall text plane in meters.")]
+        public float NavigationLocalZ { get; set; } = -0.045f;
+
+        [Description("Leaderboard navigation button height in meters.")]
+        public float NavigationButtonHeight { get; set; } = 0.34f;
+
+        [Description("Leaderboard navigation interaction depth in meters.")]
+        public float NavigationButtonDepth { get; set; } = 0.12f;
+
+        [Description("Scale of the visible leaderboard navigation labels.")]
+        public RolePreferencePoint NavigationTextScale { get; set; } = new RolePreferencePoint(0.0525f, 0.0525f, 0.0525f);
+
+        [Description("Fallback leaderboard position relative to the calculated tower centre when dynamic wall placement is disabled.")]
+        public RolePreferencePoint PositionOffset { get; set; } = new RolePreferencePoint(0f, 1.75f, 4f);
+
+        [Description("Fallback leaderboard rotation when dynamic wall placement is disabled.")]
+        public RolePreferencePoint Rotation { get; set; } = new RolePreferencePoint(0f, 0f, 0f);
+
+        [Description("Fallback leaderboard text scale.")]
+        public RolePreferencePoint Scale { get; set; } = new RolePreferencePoint(0.07875f, 0.07875f, 0.07875f);
+
+        [Description("Fallback leaderboard text canvas width.")]
+        public float DisplayWidth { get; set; } = 440f;
+
+        [Description("Fallback leaderboard text canvas height.")]
+        public float DisplayHeight { get; set; } = 360f;
     }
 
     public sealed class EventBriefingSettings
